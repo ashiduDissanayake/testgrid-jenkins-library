@@ -26,11 +26,6 @@ String productVersion = params.productVersion
 String productDeploymentRegion = params.productDeploymentRegion
 String[] osList = params.osList?.split(',')?.collect { it.trim() } ?: []
 String[] databaseList = params.databaseList?.split(',')?.collect { it.trim() } ?: []
-String albCertArn = params.albCertArn
-String acpUpdateLevel = params.acpUpdateLevel?: "-1"
-String tmUpdateLevel = params.tmUpdateLevel?: "-1"
-String gwUpdateLevel = params.gwUpdateLevel?: "-1"
-Boolean useStaging = params.useStaging
 String tfS3Bucket = params.tfS3Bucket
 String tfS3region = params.tfS3region
 String awsCred = params.awsCred
@@ -38,14 +33,9 @@ String dbPassword = params.dbPassword
 String project = params.project?: "wso2"
 Boolean onlyDestroyResources = params.onlyDestroyResources
 Boolean destroyResources = params.destroyResources
-Boolean skipTfApply = params.skipTfApply
-Boolean skipDockerBuild = params.skipDockerBuild
-Boolean skipTests = params.skipTests
 
 // Default values
 def deploymentPatterns = []
-String updateType = "u2"
-String hostName = ""
 String dbUser = "wso2carbon"
 // Helm repository details
 String helmRepoUrl = "https://github.com/wso2/helm-apim.git"
@@ -115,42 +105,6 @@ def createDeploymentPatterns(String project, String product, String productVersi
     }
 }
 
-def executeDBScripts(String dbEngine, String dbEndpoint, String dbUser, String dbPassword, String scriptPath) {
-    println "Executing DB scripts for ${dbEngine} at ${dbEndpoint}..."
-
-    try {
-        timeout(time: 5, unit: 'MINUTES') {
-            if (dbEngine == "mysql") {
-                // Execute MySQL scripts
-                println "Executing MySQL scripts..."
-                sh """
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "DROP DATABASE IF EXISTS shared_db;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "DROP DATABASE IF EXISTS apim_db;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "CREATE DATABASE IF NOT EXISTS shared_db CHARACTER SET latin1;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "CREATE DATABASE IF NOT EXISTS apim_db CHARACTER SET latin1;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -Dshared_db < ${scriptPath}/dbscripts/mysql.sql
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -Dapim_db < ${scriptPath}/dbscripts/apimgt/mysql.sql
-                """
-            } else if (dbEngine == "postgres") {
-                // Execute PostgreSQL scripts
-                println "Executing PostgreSQL scripts..."
-                sh """
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS shared_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS apim_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "CREATE DATABASE shared_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "CREATE DATABASE apim_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d shared_db -f ${scriptPath}/dbscripts/postgresql.sql
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d apim_db -f ${scriptPath}/dbscripts/apimgt/postgresql.sql
-                """
-            } else {
-                error "Unsupported DB engine: ${dbEngine}"
-            }
-        }
-    } catch (Exception e) {
-        error "Database operation timed out or failed: ${e.message}"
-    }
-}
-
 pipeline {
     agent {label 'pipeline-kubernetes-agent'}
 
@@ -193,18 +147,17 @@ pipeline {
                         }
                     }
 
+                    def common = load "utils/common.groovy"
                     // Install Terraform if not already installed
-                    installTerraform()
+                    common.installTerraform()
                     // Install Docker if not already installed
-                    installDocker()
+                    common.installDocker()
                     // Install kubectl if not already installed
-                    installKubectl()
+                    common.installKubectl()
                     // Install Helm if not already installed
-                    installHelm()
+                    common.installHelm()
                     // Install database client tools
-                    installDBClients()
-                    // Install Newman if not already installed
-                    // installNewman()
+                    common.installDBClients()
                 }
             }
         }

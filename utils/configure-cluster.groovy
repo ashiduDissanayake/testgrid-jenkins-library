@@ -34,9 +34,6 @@ String project = params.project?: "wso2"
 
 // Default values
 def deploymentPatterns = []
-String updateType = "u2"
-String hostName = ""
-String dbUser = "wso2carbon"
 // APIM Test Integration repository details
 String apimIntgRepoUrl = "https://github.com/kavindasr/apim-test-integration.git"
 String apimIntgRepoBranch = "4.5.0-profile-automation"
@@ -137,19 +134,18 @@ pipeline {
                             sh "cp -r ../${apimIntgDirectory}/${tfDirectory}/* ."
                         }
                     }
-
+                    
+                    def common = load "utils/common.groovy"
                     // Install Terraform if not already installed
-                    installTerraform()
+                    common.installTerraform()
                     // Install Docker if not already installed
-                    installDocker()
+                    common.installDocker()
                     // Install kubectl if not already installed
-                    installKubectl()
+                    common.installKubectl()
                     // Install Helm if not already installed
-                    installHelm()
+                    common.installHelm()
                     // Install database client tools
-                    installDBClients()
-                    // Install Newman if not already installed
-                    // installNewman()
+                    common.installDBClients()
                 }
             }
         }

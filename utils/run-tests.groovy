@@ -26,11 +26,6 @@ String productVersion = params.productVersion
 String productDeploymentRegion = params.productDeploymentRegion
 String[] osList = params.osList?.split(',')?.collect { it.trim() } ?: []
 String[] databaseList = params.databaseList?.split(',')?.collect { it.trim() } ?: []
-String albCertArn = params.albCertArn
-String acpUpdateLevel = params.acpUpdateLevel?: "-1"
-String tmUpdateLevel = params.tmUpdateLevel?: "-1"
-String gwUpdateLevel = params.gwUpdateLevel?: "-1"
-Boolean useStaging = params.useStaging
 String tfS3Bucket = params.tfS3Bucket
 String tfS3region = params.tfS3region
 String awsCred = params.awsCred
@@ -39,8 +34,6 @@ String project = params.project?: "wso2"
 
 // Default values
 def deploymentPatterns = []
-String updateType = "u2"
-String hostName = ""
 String dbUser = "wso2carbon"
 // Helm repository details
 String helmRepoUrl = "https://github.com/wso2/helm-apim.git"
@@ -188,18 +181,17 @@ pipeline {
                         }
                     }
 
+                    def common = load "utils/common.groovy"
                     // Install Terraform if not already installed
-                    installTerraform()
+                    common.installTerraform()
                     // Install Docker if not already installed
-                    installDocker()
+                    common.installDocker()
                     // Install kubectl if not already installed
-                    installKubectl()
+                    common.installKubectl()
                     // Install Helm if not already installed
-                    installHelm()
+                    common.installHelm()
                     // Install database client tools
-                    installDBClients()
-                    // Install Newman if not already installed
-                    // installNewman()
+                    common.installDBClients()
                 }
             }
         }

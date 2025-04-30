@@ -137,19 +137,18 @@ pipeline {
                             sh "cp -r ../${apimIntgDirectory}/${tfDirectory}/* ."
                         }
                     }
-
+                    
+                    def common = load "utils/common.groovy"
                     // Install Terraform if not already installed
-                    installTerraform()
+                    common.installTerraform()
                     // Install Docker if not already installed
-                    installDocker()
+                    common.installDocker()
                     // Install kubectl if not already installed
-                    installKubectl()
+                    common.installKubectl()
                     // Install Helm if not already installed
-                    installHelm()
+                    common.installHelm()
                     // Install database client tools
-                    installDBClients()
-                    // Install Newman if not already installed
-                    // installNewman()
+                    common.installDBClients()
                 }
             }
         }
