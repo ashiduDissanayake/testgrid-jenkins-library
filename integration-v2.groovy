@@ -627,9 +627,6 @@ pipeline {
                                                 sh """
                                                 # Delete existing release if it exists
                                                 helm list -n ${namespace} -q | xargs -n1 -I{} helm uninstall {} -n ${namespace} || echo "Failed to delete existing release."
-
-                                                # Delete gateway REST ingress if it exists
-                                                kubectl delete ingress gw-rest-ingress -n ${namespace} || echo "Skipped deleting existing ingress."
                                                 """
 
                                                 String wso2amAcpImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-acp --query 'imageDetails[?contains(imageTags, `${dbEngineNameSafe}-latest`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
@@ -644,11 +641,6 @@ pipeline {
                                                 String helmChartPath = "${pwd}/${helmDirectory}"
                                                 // Install the product using Helm
                                                 sh """
-                                                    # Helm-apim does not have a ingress to expose gateway REST API. So we need to create a ingress resource to expose the REST API.
-                                                    helm install apim-ing ${pwd}/${apimIntgDirectory}/kubernetes/gw-ingress \
-                                                        --set hostname=gw-${dbEngineNameSafe}.wso2.com \
-                                                        --namespace ${namespace}
-                                                    
                                                     # Deploy wso2am-acp
                                                     echo "Deploying WSO2 API Manager - API Control Plane in ${namespace} namespace..."
                                                     helm install apim-acp ${helmChartPath}/distributed/control-plane \
