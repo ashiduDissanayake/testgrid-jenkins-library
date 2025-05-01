@@ -31,6 +31,7 @@ String tfS3region = params.tfS3region
 String awsCred = params.awsCred
 String dbPassword = params.dbPassword
 String project = params.project?: "wso2"
+String albCertArn = params.albCertArn ?: ""
 
 // Default values
 def deploymentPatterns = []
