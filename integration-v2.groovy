@@ -53,7 +53,7 @@ String helmRepoBranch = "main"
 String helmDirectory = "helm-apim"
 // APIM Test Integration repository details
 String apimIntgRepoUrl = "https://github.com/kavindasr/apim-test-integration.git"
-String apimIntgRepoBranch = "4.5.0-profile-automation"
+String apimIntgRepoBranch = "4.5.0-profile-automation-2"
 String apimIntgDirectory = "apim-test-integration"
 String tfDirectory = "terraform"
 String tfEnvironment = "dev"
