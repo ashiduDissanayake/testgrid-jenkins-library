@@ -80,7 +80,7 @@ stages {
                         ./scripts/write-parameter-file.sh "TESTGRID_EMAIL_PASSWORD" ${testgridEmailPassword} "${WORKSPACE}/parameters/parameters.json"
                     '''
                 }
-                withCredentials([usernamePassword(credentialsId: 'WSO2_GITHUB_TOKEN', usernameVariable: 'githubUserName', passwordVariable: 'githubPassword')]) 
+                withCredentials([usernamePassword(credentialsId: 'ksr-git', usernameVariable: 'githubUserName', passwordVariable: 'githubPassword')]) 
                 {
                     sh '''
                        echo "Writting Github Username to parameter file"
