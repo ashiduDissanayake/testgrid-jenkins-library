@@ -24,13 +24,18 @@ import groovy.json.JsonSlurperClassic
 String product = params.product
 String productVersion = params.productVersion
 String productDeploymentRegion = params.productDeploymentRegion
-String[] osList = params.osList?.split(',')?.collect { it.trim() } ?: []
 String[] databaseList = params.databaseList?.split(',')?.collect { it.trim() } ?: []
 String albCertArn = params.albCertArn
-String acpUpdateLevel = params.acpUpdateLevel?: "-1"
-String tmUpdateLevel = params.tmUpdateLevel?: "-1"
-String gwUpdateLevel = params.gwUpdateLevel?: "-1"
+// skipPeerTest: false (default) → run all 4 peer test patterns automatically.
+//              true             → custom / manual mode with a single deployment.
+Boolean skipPeerTest = params.skipPeerTest ?: false
+// Per-component update levels (used in both modes).
+String acpUpdateLevel = params.acpUpdateLevel ?: "-1"
+String tmUpdateLevel = params.tmUpdateLevel ?: "-1"
+String gwUpdateLevel = params.gwUpdateLevel ?: "-1"
 Boolean useStaging = params.useStaging
+// Hardcoded OS — only Ubuntu is supported
+String os = "ubuntu"
 String tfS3Bucket = params.tfS3Bucket
 String tfS3region = params.tfS3region
 String awsCred = params.awsCred
@@ -43,6 +48,7 @@ Boolean skipDockerBuild = params.skipDockerBuild
 Boolean skipTests = params.skipTests
 
 // Default values
+def infraConfig = [:]
 def deploymentPatterns = []
 String updateType = "u2"
 String hostName = ""
@@ -77,70 +83,98 @@ def dbEngineList = [
         ],
 ]
 
-// Create deployment patterns for all combinations of OS and database
-@NonCPS
-def createDeploymentPatterns(String project, String product, String productVersion, 
-                                String[] osList, String[] databaseList, def dbEngineList, def deploymentPatterns) {
-    println "Creating the deployment patterns by using infrastructure combination!"
-    
-    int count = 1
-    for (String os : osList) {
-        def dbEngines = []
-        for (String db : databaseList) {
-            def dbDetails = dbEngineList[db]
-            if (dbDetails == null) {
-                println "DB engine version not found for ${db}. Skipping..."
-                continue
-            }
-            dbEngines.add([
-                engine: db,
-                version: dbDetails.version,
-                port: dbDetails.port,
-            ])
-        }
-        String deploymentDirName = "${project}-${product}-${productVersion}-${os}"
-        
-        def dbEnginesJson = new groovy.json.JsonBuilder(dbEngines).toString()
-        def deploymentPattern = [
-            id: count++,
-            product: product,
-            version: productVersion,
-            os: os,
-            dbEngines: dbEngines,
-            dbEnginesJson: dbEnginesJson,
-            directory: deploymentDirName,
-            eksDesiredSize: 5*dbEngines.size(),
-        ]
-        deploymentPatterns.add(deploymentPattern)
-    }
+// ============================================================================
+// DEPLOYMENT PATTERNS
+// ============================================================================
+// skipPeerTest=false (default): All 4 peer test patterns run in parallel:
+//   Pattern 1: All components on staging (latest update)
+//   Pattern 2: Only ACP on staging, TM and GW on GA
+//   Pattern 3: Only TM on staging, ACP and GW on GA
+//   Pattern 4: Only GW on staging, ACP and TM on GA
+// skipPeerTest=true: A single custom pattern is used.
+// ============================================================================
+int nodesPerNamespace = 5
+
+if (!skipPeerTest) {
+    deploymentPatterns = [
+        [name: "all-staging", acpVariant: "latest", tmVariant: "latest", gwVariant: "latest"],
+        [name: "acp-staging", acpVariant: "latest", tmVariant: "ga",     gwVariant: "ga"],
+        [name: "tm-staging",  acpVariant: "ga",     tmVariant: "latest", gwVariant: "ga"],
+        [name: "gw-staging",  acpVariant: "ga",     tmVariant: "ga",     gwVariant: "latest"],
+    ]
+} else {
+    deploymentPatterns = [
+        [name: "custom", acpVariant: "latest", tmVariant: "latest", gwVariant: "latest"],
+    ]
 }
 
-def executeDBScripts(String dbEngine, String dbEndpoint, String dbUser, String dbPassword, String scriptPath) {
-    println "Executing DB scripts for ${dbEngine} at ${dbEndpoint}..."
+// Initialize single infrastructure configuration for ubuntu OS and all database combinations
+@NonCPS
+def initInfraConfig(String project, String product, String productVersion, 
+                    String os, String[] databaseList, def dbEngineList, 
+                    def infraConfig, int nodesPerNamespace, int deploymentPatternCount) {
+    println "Initializing infrastructure configuration!"
+    
+    def dbEngines = []
+    for (String db : databaseList) {
+        def dbDetails = dbEngineList[db]
+        if (dbDetails == null) {
+            println "DB engine version not found for ${db}. Skipping..."
+            continue
+        }
+        dbEngines.add([
+            engine: db,
+            version: dbDetails.version,
+            port: dbDetails.port,
+        ])
+    }
+    String deploymentDirName = "${project}-${product}-${productVersion}-${os}"
+    
+    def dbEnginesJson = new groovy.json.JsonBuilder(dbEngines).toString()
+    infraConfig.id = 1
+    infraConfig.product = product
+    infraConfig.version = productVersion
+    infraConfig.os = os
+    infraConfig.dbEngines = dbEngines
+    infraConfig.dbEnginesJson = dbEnginesJson
+    infraConfig.directory = deploymentDirName
+    // Scale EKS nodes to handle all deployment patterns running in parallel
+    infraConfig.eksDesiredSize = nodesPerNamespace * dbEngines.size() * deploymentPatternCount
+}
+
+/**
+ * Execute DB scripts to create and initialise databases.
+ * @param dbSuffix  Suffix for unique DB names per test pattern (e.g. "all_staging").
+ *                  Use empty string "" for single-pattern / custom mode (names stay shared_db, apim_db).
+ */
+def executeDBScripts(String dbEngine, String dbEndpoint, String dbUser, String dbPassword, 
+                     String scriptPath, String dbSuffix) {
+    
+    String sharedDbName = dbSuffix ? "shared_db_${dbSuffix}" : "shared_db"
+    String apimDbName   = dbSuffix ? "apim_db_${dbSuffix}"   : "apim_db"
+    println "Executing DB scripts for ${dbEngine} at ${dbEndpoint} (databases: ${sharedDbName}, ${apimDbName})..."
 
     try {
         timeout(time: 5, unit: 'MINUTES') {
             if (dbEngine == "mysql") {
-                // Execute MySQL scripts
                 println "Executing MySQL scripts..."
                 sh """
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "DROP DATABASE IF EXISTS shared_db;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "DROP DATABASE IF EXISTS apim_db;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "CREATE DATABASE IF NOT EXISTS shared_db CHARACTER SET latin1;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "CREATE DATABASE IF NOT EXISTS apim_db CHARACTER SET latin1;"
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -Dshared_db < ${scriptPath}/dbscripts/mysql.sql
-                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -Dapim_db < ${scriptPath}/dbscripts/apimgt/mysql.sql
+                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "DROP DATABASE IF EXISTS ${sharedDbName};"
+                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "DROP DATABASE IF EXISTS ${apimDbName};"
+                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "CREATE DATABASE IF NOT EXISTS ${sharedDbName} CHARACTER SET latin1;"
+                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -e "CREATE DATABASE IF NOT EXISTS ${apimDbName} CHARACTER SET latin1;"
+                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -D${sharedDbName} < ${scriptPath}/dbscripts/mysql.sql
+                    mysql -h ${dbEndpoint} -u ${dbUser} -p$dbPassword -D${apimDbName} < ${scriptPath}/dbscripts/apimgt/mysql.sql
                 """
             } else if (dbEngine == "postgres") {
-                // Execute PostgreSQL scripts
                 println "Executing PostgreSQL scripts..."
                 sh """
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS shared_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS apim_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "CREATE DATABASE shared_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "CREATE DATABASE apim_db;"
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d shared_db -f ${scriptPath}/dbscripts/postgresql.sql
-                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d apim_db -f ${scriptPath}/dbscripts/apimgt/postgresql.sql
+                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS ${sharedDbName};"
+                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "DROP DATABASE IF EXISTS ${apimDbName};"
+                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "CREATE DATABASE ${sharedDbName};"
+                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d postgres -c "CREATE DATABASE ${apimDbName};"
+                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d ${sharedDbName} -f ${scriptPath}/dbscripts/postgresql.sql
+                    PGPASSWORD=$dbPassword psql -h ${dbEndpoint} -U ${dbUser} -d ${apimDbName} -f ${scriptPath}/dbscripts/apimgt/postgresql.sql
                 """
             } else {
                 error "Unsupported DB engine: ${dbEngine}"
@@ -324,22 +358,24 @@ pipeline {
         stage('Preparation') {
             steps {
                 script {
-                    println "OS List: ${osList}"
+                    println "OS: ${os}"
                     println "Database List: ${databaseList}"
-                    createDeploymentPatterns(project, product, productVersion, osList, databaseList, dbEngineList, deploymentPatterns)
+                    println "Skip Peer Test: ${skipPeerTest}"
+                    println "Deployment Patterns: ${deploymentPatterns.collect { it.name }}"
+                    println "Update Levels — ACP: ${acpUpdateLevel}, TM: ${tmUpdateLevel}, GW: ${gwUpdateLevel}"
+                    initInfraConfig(project, product, productVersion, os, databaseList, 
+                                    dbEngineList, infraConfig, nodesPerNamespace, deploymentPatterns.size())
 
-                    println "Deployment patterns created: ${deploymentPatterns}"
+                    println "Infrastructure config: ${infraConfig}"
 
-                    // Create directories for each deployment pattern
-                    for (def pattern : deploymentPatterns) {
-                        def deploymentDirName = pattern.directory
-                        println "Creating directory: ${deploymentDirName}"
-                        sh "mkdir -p ${deploymentDirName}"
-                        
-                        // Copy the Terraform files to the respective directories
-                        dir("${deploymentDirName}") {
-                            sh "cp -r ../${apimIntgDirectory}/${tfDirectory}/* ."
-                        }
+                    // Create directory for infrastructure
+                    def deploymentDirName = infraConfig.directory
+                    println "Creating directory: ${deploymentDirName}"
+                    sh "mkdir -p ${deploymentDirName}"
+                    
+                    // Copy the Terraform files to the directory
+                    dir("${deploymentDirName}") {
+                        sh "cp -r ../${apimIntgDirectory}/${tfDirectory}/* ."
                     }
 
                     // Install Terraform if not already installed
@@ -367,16 +403,14 @@ pipeline {
                         accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                         secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                     ]]) { 
-                        for (def pattern : deploymentPatterns) {
-                            def deploymentDirName = pattern.directory
-                            dir("${deploymentDirName}") {
-                                println "Running Terraform init for ${deploymentDirName}..."
-                                sh """
-                                    terraform init -backend-config="bucket=${tfS3Bucket}" \
-                                        -backend-config="region=${tfS3region}" \
-                                        -backend-config="key=${deploymentDirName}.tfstate"
-                                """
-                            }
+                        def deploymentDirName = infraConfig.directory
+                        dir("${deploymentDirName}") {
+                            println "Running Terraform init for ${deploymentDirName}..."
+                            sh """
+                                terraform init -backend-config="bucket=${tfS3Bucket}" \
+                                    -backend-config="region=${tfS3region}" \
+                                    -backend-config="key=${deploymentDirName}.tfstate"
+                            """
                         }
                     }
                 }
@@ -395,21 +429,19 @@ pipeline {
                         accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                         secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                     ]]) { 
-                        for (def pattern : deploymentPatterns) {
-                            def deploymentDirName = pattern.directory
-                            dir("${deploymentDirName}") {
-                                println "Running Terraform plan for ${deploymentDirName}..."
-                                sh """
-                                    terraform plan \
-                                        -var="project=${project}" \
-                                        -var="client_name=${pattern.id}" \
-                                        -var="region=${productDeploymentRegion}" \
-                                        -var='db_engine_options=${pattern.dbEnginesJson}' \
-                                        -var="db_password=$dbPassword" \
-                                        -var="eks_default_nodepool_desired_size=${pattern.eksDesiredSize}" \
-                                        -no-color
-                                """
-                            }
+                        def deploymentDirName = infraConfig.directory
+                        dir("${deploymentDirName}") {
+                            println "Running Terraform plan for ${deploymentDirName}..."
+                            sh """
+                                terraform plan \
+                                    -var="project=${project}" \
+                                    -var="client_name=${infraConfig.id}" \
+                                    -var="region=${productDeploymentRegion}" \
+                                    -var='db_engine_options=${infraConfig.dbEnginesJson}' \
+                                    -var="db_password=$dbPassword" \
+                                    -var="eks_default_nodepool_desired_size=${infraConfig.eksDesiredSize}" \
+                                    -no-color
+                            """
                         }
                     }
                 }
@@ -429,21 +461,19 @@ pipeline {
                             accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                             secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                         ]]) { 
-                            for (def pattern : deploymentPatterns) {
-                                def deploymentDirName = pattern.directory
-                                dir("${deploymentDirName}") {
-                                    println "Running Terraform apply for ${deploymentDirName}..."
-                                    sh """
-                                        terraform apply -auto-approve \
-                                            -var="project=${project}" \
-                                            -var="client_name=${pattern.id}" \
-                                            -var="region=${productDeploymentRegion}" \
-                                            -var='db_engine_options=${pattern.dbEnginesJson}' \
-                                            -var="db_password=$dbPassword" \
-                                            -var="eks_default_nodepool_desired_size=${pattern.eksDesiredSize}" \
-                                            -no-color
-                                    """
-                                }
+                            def deploymentDirName = infraConfig.directory
+                            dir("${deploymentDirName}") {
+                                println "Running Terraform apply for ${deploymentDirName}..."
+                                sh """
+                                    terraform apply -auto-approve \
+                                        -var="project=${project}" \
+                                        -var="client_name=${infraConfig.id}" \
+                                        -var="region=${productDeploymentRegion}" \
+                                        -var='db_engine_options=${infraConfig.dbEnginesJson}' \
+                                        -var="db_password=$dbPassword" \
+                                        -var="eks_default_nodepool_desired_size=${infraConfig.eksDesiredSize}" \
+                                        -no-color
+                                """
                             }
                         }
                     } catch (Exception e) {
@@ -467,45 +497,43 @@ pipeline {
                             accessKeyVariable: 'AWS_ACCESS_KEY_ID',
                             secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                         ]]) { 
-                            for (def pattern : deploymentPatterns) {
-                                def deploymentDirName = pattern.directory
-                                dir("${deploymentDirName}") {
-                                    println "Configuring EKS for ${deploymentDirName}..."
-                                    // EKS cluster name follows this pattern defined in the AWS Terraform modules:
-                                    // https://github.com/wso2/aws-terraform-modules/blob/c9820b842ff2227c10bd22f4ff076461d972d520/modules/aws/EKS-Cluster/eks.tf#L21
-                                    sh """
-                                        aws eks --region ${productDeploymentRegion} \
-                                        update-kubeconfig --name ${project}-${pattern.id}-${tfEnvironment}-${productDeploymentRegion}-eks \
-                                        --alias ${pattern.directory}
+                            def deploymentDirName = infraConfig.directory
+                            dir("${deploymentDirName}") {
+                                println "Configuring EKS for ${deploymentDirName}..."
+                                // EKS cluster name follows this pattern defined in the AWS Terraform modules:
+                                // https://github.com/wso2/aws-terraform-modules/blob/c9820b842ff2227c10bd22f4ff076461d972d520/modules/aws/EKS-Cluster/eks.tf#L21
+                                sh """
+                                    aws eks --region ${productDeploymentRegion} \
+                                    update-kubeconfig --name ${project}-${infraConfig.id}-${tfEnvironment}-${productDeploymentRegion}-eks \
+                                    --alias ${infraConfig.directory}
 
-                                        # Install nginx ingress controller
-                                        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.0.4/deploy/static/provider/aws/deploy.yaml || { echo "failed to install nginx ingress controller." ; exit 1 ; }
+                                    # Install nginx ingress controller
+                                    kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.0.4/deploy/static/provider/aws/deploy.yaml || { echo "failed to install nginx ingress controller." ; exit 1 ; }
 
-                                        # Delete Nginx admission if it exists.
-                                        kubectl delete -A ValidatingWebhookConfiguration ingress-nginx-admission || echo "WARNING : Failed to delete nginx admission."
+                                    # Delete Nginx admission if it exists.
+                                    kubectl delete -A ValidatingWebhookConfiguration ingress-nginx-admission || echo "WARNING : Failed to delete nginx admission."
 
-                                        # Wait for nginx to come alive.
-                                        kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=480s ||  { echo 'Nginx service is not ready within the expected time limit.';  exit 1; }
-                                    """
+                                    # Wait for nginx to come alive.
+                                    kubectl wait --namespace ingress-nginx --for=condition=ready pod --selector=app.kubernetes.io/component=controller --timeout=480s ||  { echo 'Nginx service is not ready within the expected time limit.';  exit 1; }
+                                """
 
-                                    hostName = sh(script: "kubectl -n ingress-nginx get svc ingress-nginx-controller -o json | jq -r '.status.loadBalancer.ingress[0].hostname'", returnStdout: true).trim()
-                                    println "Ingress Host Name: ${hostName}"
-                                    pattern.hostName = hostName
+                                hostName = sh(script: "kubectl -n ingress-nginx get svc ingress-nginx-controller -o json | jq -r '.status.loadBalancer.ingress[0].hostname'", returnStdout: true).trim()
+                                println "Ingress Host Name: ${hostName}"
+                                infraConfig.hostName = hostName
 
-                                    def ecrWso2AcpURL = sh(script: "terraform output -json | jq -r '.ecr_wso2am_acp_url.value'", returnStdout: true).trim()
-                                    def ecrCommonURL = ecrWso2AcpURL.split('/')[0]
-                                    println "ECR Common URL: ${ecrCommonURL}"
+                                def ecrWso2AcpURL = sh(script: "terraform output -json | jq -r '.ecr_wso2am_acp_url.value'", returnStdout: true).trim()
+                                def ecrCommonURL = ecrWso2AcpURL.split('/')[0]
+                                println "ECR Common URL: ${ecrCommonURL}"
 
-                                    def password = sh(
-                                        script: "aws ecr get-login-password --region ${productDeploymentRegion}",
-                                        returnStdout: true
-                                    ).trim()
-                                    pattern.dockerRegistry = [
-                                        registry: ecrCommonURL,
-                                        username: "AWS",
-                                        password: password
-                                    ]
-                                }
+                                def password = sh(
+                                    script: "aws ecr get-login-password --region ${productDeploymentRegion}",
+                                    returnStdout: true
+                                ).trim()
+                                infraConfig.dockerRegistry = [
+                                    registry: ecrCommonURL,
+                                    username: "AWS",
+                                    password: password
+                                ]
                             }
                         }
                     } catch (Exception e) {
@@ -522,37 +550,75 @@ pipeline {
             }
             steps {
                 script {
-                    // Create a map of parallel builds - one for each OS
                     def parallelBuilds = [:]
                     
-                    for (def pattern : deploymentPatterns) {
-                        for (def dbEngine : pattern.dbEngines) {
-                            // Need to bind the os variable within the closure
-                            def currentOs = pattern.os
-                            def db = dbEngine.engine
-                            def dbDriverUrl = dbEngineList[db].driverUrl
-                            def dockerRegistry = pattern.dockerRegistry.registry
-                            def dockerRegistryUsername = pattern.dockerRegistry.username
-                            def dockerRegistryPassword = pattern.dockerRegistry.password
-                            
-                            parallelBuilds["Build ${currentOs}-${db} wso2am-acp image"] = {
+                    def currentOs = infraConfig.os
+                    def dockerRegistry = infraConfig.dockerRegistry.registry
+                    def dockerRegistryUsername = infraConfig.dockerRegistry.username
+                    def dockerRegistryPassword = infraConfig.dockerRegistry.password
+                    
+                    for (def dbEngine : infraConfig.dbEngines) {
+                        def db = dbEngine.engine
+                        def dbDriverUrl = dbEngineList[db].driverUrl
+                        
+                        if (!skipPeerTest) {
+                            // ============================================================
+                            // PEER TEST MODE: Build 6 unique images per DB
+                            //   3 apps x 2 variants (latest, ga)
+                            //   Tags: {db}-latest  (updated version, user-provided update levels)
+                            //         {db}-ga      (initial version, update level 0)
+                            // ============================================================
+                            // Build "latest" variant — updated version with user-provided update levels
+                            parallelBuilds["Build ${db}-latest wso2am-acp"] = {
                                 buildDockerImage(project, "wso2am-acp", '4.5.0', currentOs, acpUpdateLevel, "${db}-latest", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
                             }
-                            parallelBuilds["Build ${currentOs}-${db} wso2am-tm image"] = {
+                            parallelBuilds["Build ${db}-latest wso2am-tm"] = {
                                 buildDockerImage(project, "wso2am-tm", '4.5.0', currentOs, tmUpdateLevel, "${db}-latest", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
                             }
-                            parallelBuilds["Build ${currentOs}-${db} wso2am-universal-gw image"] = {
+                            parallelBuilds["Build ${db}-latest wso2am-universal-gw"] = {
+                                buildDockerImage(project, "wso2am-universal-gw", '4.5.0', currentOs, gwUpdateLevel, "${db}-latest", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
+                            }
+                            // Build "ga" variant — initial version (update level 0, no updates applied)
+                            parallelBuilds["Build ${db}-ga wso2am-acp"] = {
+                                buildDockerImage(project, "wso2am-acp", '4.5.0', currentOs, "0", "${db}-ga", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
+                            }
+                            parallelBuilds["Build ${db}-ga wso2am-tm"] = {
+                                buildDockerImage(project, "wso2am-tm", '4.5.0', currentOs, "0", "${db}-ga", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
+                            }
+                            parallelBuilds["Build ${db}-ga wso2am-universal-gw"] = {
+                                buildDockerImage(project, "wso2am-universal-gw", '4.5.0', currentOs, "0", "${db}-ga", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
+                            }
+                        } else {
+                            // ============================================================
+                            // CUSTOM MODE: Build 3 images using user-provided update levels
+                            //   useStaging from pipeline param, tag: {db}-latest
+                            // ============================================================
+                            parallelBuilds["Build ${db} wso2am-acp image"] = {
+                                buildDockerImage(project, "wso2am-acp", '4.5.0', currentOs, acpUpdateLevel, "${db}-latest", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
+                            }
+                            parallelBuilds["Build ${db} wso2am-tm image"] = {
+                                buildDockerImage(project, "wso2am-tm", '4.5.0', currentOs, tmUpdateLevel, "${db}-latest", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
+                            }
+                            parallelBuilds["Build ${db} wso2am-universal-gw image"] = {
                                 buildDockerImage(project, "wso2am-universal-gw", '4.5.0', currentOs, gwUpdateLevel, "${db}-latest", dbDriverUrl, dockerRegistry, dockerRegistryUsername, dockerRegistryPassword, useStaging)
                             }
                         }
                     }
                     
-                    // Execute all builds in parallel
+                    println "Total docker builds: ${parallelBuilds.size()} (skipPeerTest=${skipPeerTest})"
                     parallel parallelBuilds
                 }
             }
         }
 
+        // ====================================================================
+        // STAGE: Deploy and test
+        //   skipPeerTest=false : Deploys all 4 deployment patterns in parallel
+        //   skipPeerTest=true  : Deploys a single pattern (original behaviour)
+        //
+        //   Each deployment pattern runs in its own K8s namespace with its own
+        //   DB names and hostnames to avoid collisions.
+        // ====================================================================
         stage('Prepare Deployment and Test') {
             steps {
                 script {
@@ -563,22 +629,33 @@ pipeline {
                     
                     // Create a map of parallel deployment tasks
                     def parallelDeployments = [:]
+                    def infraDir = infraConfig.directory
+                    def dockerRegistrySafe = infraConfig.dockerRegistry.registry
+                    def dockerRegistryUsernameSafe = infraConfig.dockerRegistry.username
+                    def dockerRegistryPasswordSafe = infraConfig.dockerRegistry.password
                     
-                    // Add each deployment as a parallel task
-                    for (def pattern : deploymentPatterns) {
-                        def patternDir = pattern.directory
-                        for (def dbEngine : pattern.dbEngines) {
-                            def dbEngineName = dbEngine.engine
-                            
-                            // We need to use variables that are safe for the closure
-                            def patternDirSafe = patternDir
-                            def dbEngineNameSafe = dbEngineName
-                            def patternSafe = pattern
-                            def dockerRegistrySafe = pattern.dockerRegistry.registry
-                            def dockerRegistryUsernameSafe = pattern.dockerRegistry.username
-                            def dockerRegistryPasswordSafe = pattern.dockerRegistry.password
-                            def stageId = "${patternDirSafe}-${dbEngineNameSafe}"
-                            
+                    // Loop over deployment patterns (4 in peer-test mode, 1 in custom mode)
+                    for (def dp : deploymentPatterns) {
+                        for (def dbEngine : infraConfig.dbEngines) {
+                            // Capture variables for closure safety
+                            def infraDirSafe = infraDir
+                            def dbEngineNameSafe = dbEngine.engine
+                            def dpSafe = dp
+                            def dpName = dp.name
+                            def dockerRegSafe = dockerRegistrySafe
+                            def dockerRegUserSafe = dockerRegistryUsernameSafe
+                            def dockerRegPassSafe = dockerRegistryPasswordSafe
+
+                            // Unique stage identifier including deployment pattern name
+                            def stageId = "${infraDirSafe}-${dbEngineNameSafe}-${dpName}"
+                            // DB suffix for unique database names. Empty for custom single-pattern mode.
+                            def dbSuffix = (deploymentPatterns.size() > 1) ? dpName.replace('-', '_') : ""
+
+                            // Determine the docker image tag for each component based on deployment pattern
+                            def acpImageTag = "${dbEngineNameSafe}-${dpSafe.acpVariant}"  // e.g. mysql-latest or mysql-ga
+                            def tmImageTag  = "${dbEngineNameSafe}-${dpSafe.tmVariant}"
+                            def gwImageTag  = "${dbEngineNameSafe}-${dpSafe.gwVariant}"
+                        
                             // Add deployment task to parallel map
                             parallelDeployments["Deploy ${stageId}"] = {
                                 stage("Deploy ${stageId}") {
@@ -594,24 +671,36 @@ pipeline {
                                             String pwd = sh(script: "pwd", returnStdout: true).trim()
                                             // Login to Docker registry
                                             sh """
-                                                echo ${dockerRegistryPasswordSafe} | sudo docker login ${dockerRegistrySafe} --username ${dockerRegistryUsernameSafe} --password-stdin
+                                                echo ${dockerRegPassSafe} | sudo docker login ${dockerRegSafe} --username ${dockerRegUserSafe} --password-stdin
                                             """
 
-                                            dir("${patternDirSafe}") {
+                                            dir("${infraDirSafe}") {
                                                 def dbWriterEndpointsJson = sh(script: "terraform output -json | jq -r '.database_writer_endpoints.value'", returnStdout: true).trim()
                                                 def dbWriterEndpoints = new groovy.json.JsonSlurperClassic().parseText(dbWriterEndpointsJson)
                                                 if (!dbWriterEndpoints) {
-                                                    error "DB Writer Endpoints are null or empty for ${patternDirSafe}. Please check the Terraform output."
+                                                    error "DB Writer Endpoints are null or empty for ${infraDirSafe}. Please check the Terraform output."
                                                 }
                                                 println "DB Writer Endpoints: ${dbWriterEndpoints}"
                                                 // Convert LazyMap to HashMap
-                                                patternSafe.dbEndpoints = new HashMap<>(dbWriterEndpoints)
+                                                infraConfig.dbEndpoints = new HashMap<>(dbWriterEndpoints)
 
-                                                def (endpoint, dbPort) = patternSafe.dbEndpoints["${dbEngineNameSafe}-${dbEngineList[dbEngineNameSafe].version}"]?.tokenize(':')
-                                                def namespace = "${patternSafe.id}-${dbEngineNameSafe}"
+                                                def (endpoint, dbPort) = infraConfig.dbEndpoints["${dbEngineNameSafe}-${dbEngineList[dbEngineNameSafe].version}"]?.tokenize(':')
+                                                // Namespace includes deployment pattern name for isolation
+                                                def namespace = (deploymentPatterns.size() > 1) ? "${infraConfig.id}-${dbEngineNameSafe}-${dpName}" : "${infraConfig.id}-${dbEngineNameSafe}"
+                                                // Unique DB names for this deployment pattern
+                                                String sharedDbName = dbSuffix ? "shared_db_${dbSuffix}" : "shared_db"
+                                                String apimDbName   = dbSuffix ? "apim_db_${dbSuffix}"   : "apim_db"
+
+                                                // Hostnames include deployment pattern name when running multiple patterns
+                                                def hostSuffix = (deploymentPatterns.size() > 1) ? "${dbEngineNameSafe}-${dpName}" : "${dbEngineNameSafe}"
+                                                def portalHost = "am-${hostSuffix}.wso2.com"
+                                                def gwHost     = "gw-${hostSuffix}.wso2.com"
+                                                def wsHost     = "websocket-${hostSuffix}.wso2.com"
+                                                def websubHost = "websub-${hostSuffix}.wso2.com"
+
                                                 sh """
                                                     # Change context
-                                                    kubectl config use-context ${patternDirSafe}
+                                                    kubectl config use-context ${infraDirSafe}
 
                                                     # Create a namespace for the deployment
                                                     kubectl create namespace ${namespace} || echo "Namespace ${namespace} already exists."
@@ -632,146 +721,147 @@ pipeline {
                                                 kubectl delete ingress gw-rest-ingress -n ${namespace} || echo "Skipped deleting existing ingress."
                                                 """
 
-                                                String wso2amAcpImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-acp --query 'imageDetails[?contains(imageTags, `${dbEngineNameSafe}-latest`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
-                                                String wso2amTmImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-tm --query 'imageDetails[?contains(imageTags, `${dbEngineNameSafe}-latest`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
-                                                String wso2amGwImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-universal-gw --query 'imageDetails[?contains(imageTags, `${dbEngineNameSafe}-latest`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
+                                                // Fetch image digests using variant-specific tags
+                                                String wso2amAcpImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-acp --query 'imageDetails[?contains(imageTags, `${acpImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
+                                                String wso2amTmImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-tm --query 'imageDetails[?contains(imageTags, `${tmImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
+                                                String wso2amGwImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-universal-gw --query 'imageDetails[?contains(imageTags, `${gwImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
 
                                                 sleep 60
 
-                                                // Execute DB scripts
-                                                executeDBScripts(dbEngineNameSafe, endpoint, dbUser, dbPassword, "${pwd}/${apimIntgDirectory}")
+                                                // Execute DB scripts with per-pattern database names
+                                                executeDBScripts(dbEngineNameSafe, endpoint, dbUser, dbPassword, "${pwd}/${apimIntgDirectory}", dbSuffix)
 
                                                 String helmChartPath = "${pwd}/${helmDirectory}"
                                                 // Install the product using Helm
                                                 sh """
-                                                    # Helm-apim does not have a ingress to expose gateway REST API. So we need to create a ingress resource to expose the REST API.
-                                                    helm install apim-ing ${pwd}/${apimIntgDirectory}/kubernetes/gw-ingress \
-                                                        --set hostname=gw-${dbEngineNameSafe}.wso2.com \
+                                                    # Gateway REST ingress
+                                                    helm install apim-ing ${pwd}/${apimIntgDirectory}/kubernetes/gw-ingress \\
+                                                        --set hostname=${gwHost} \\
                                                         --namespace ${namespace}
                                                     
-                                                    # Deploy wso2am-acp
-                                                    echo "Deploying WSO2 API Manager - API Control Plane in ${namespace} namespace..."
-                                                    helm install apim-acp ${helmChartPath}/distributed/control-plane \
-                                                        --namespace ${namespace} \
-                                                        --set aws.enabled=false \
-                                                        --set wso2.apim.configurations.adminUsername="admin" \
-                                                        --set wso2.apim.configurations.adminPassword="admin" \
-                                                        --set wso2.apim.configurations.security.keystores.primary.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.primary.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.tls.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.tls.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.internal.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.internal.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.truststore.password="wso2carbon" \
-                                                        --set wso2.deployment.resources.requests.cpu="1000m" \
-                                                        --set wso2.apim.configurations.userStore.properties.ReadGroups=true \
-                                                        --set kubernetes.ingress.controlPlane.hostname="am-${dbEngineNameSafe}.wso2.com" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].name="Default" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].type="hybrid" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].gatewayType="Regular" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].provider="wso2" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].displayInApiConsole=true \
-                                                        --set wso2.apim.configurations.gateway.environments[0].description="This is a hybrid gateway that handles both production and sandbox token traffic." \
-                                                        --set wso2.apim.configurations.gateway.environments[0].showAsTokenEndpointUrl=true \
-                                                        --set wso2.apim.configurations.gateway.environments[0].serviceName="apim-universal-gw-wso2am-universal-gw-service" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].servicePort=9443 \
-                                                        --set wso2.apim.configurations.gateway.environments[0].wsHostname="websocket-${dbEngineNameSafe}.wso2.com" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].httpHostname="gw-${dbEngineNameSafe}.wso2.com" \
-                                                        --set wso2.apim.configurations.gateway.environments[0].websubHostname="websub-${dbEngineNameSafe}.wso2.com" \
-                                                        --set wso2.apim.configurations.devportal.enableApplicationSharing=true \
-                                                        --set wso2.apim.configurations.devportal.applicationSharingType="default" \
-                                                        --set wso2.apim.configurations.oauth_config.oauth2JWKSUrl="https://apim-acp-wso2am-acp-service:9443/oauth2/jwks" \
-                                                        --set wso2.deployment.image.registry="${dockerRegistrySafe}" \
-                                                        --set wso2.deployment.image.repository="${project}-wso2am-acp:${dbEngineNameSafe}-latest" \
-                                                        --set wso2.deployment.image.digest="${wso2amAcpImageDigest}" \
-                                                        --set wso2.deployment.image.imagePullSecrets.enabled=true \
-                                                        --set wso2.deployment.image.imagePullSecrets.username="${dockerRegistryUsernameSafe}" \
-                                                        --set wso2.deployment.image.imagePullSecrets.password="${dockerRegistryPasswordSafe}" \
-                                                        --set wso2.apim.configurations.databases.type="${dbEngineList[dbEngineNameSafe].dbType}" \
-                                                        --set wso2.apim.configurations.databases.jdbc.driver="${dbEngineList[dbEngineNameSafe].dbDriver}" \
-                                                        --set wso2.apim.configurations.databases.apim_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/apim_db?useSSL=false" \
-                                                        --set wso2.apim.configurations.databases.apim_db.username="${dbUser}" \
-                                                        --set wso2.apim.configurations.databases.apim_db.password="${dbPassword}" \
-                                                        --set wso2.apim.configurations.databases.shared_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/shared_db?useSSL=false" \
-                                                        --set wso2.apim.configurations.databases.shared_db.username="${dbUser}" \
+                                                    # Deploy wso2am-acp (variant: ${dpSafe.acpVariant})
+                                                    echo "Deploying WSO2 API Manager - API Control Plane [${dpSafe.acpVariant}] in ${namespace} namespace..."
+                                                    helm install apim-acp ${helmChartPath}/distributed/control-plane \\
+                                                        --namespace ${namespace} \\
+                                                        --set aws.enabled=false \\
+                                                        --set wso2.apim.configurations.adminUsername="admin" \\
+                                                        --set wso2.apim.configurations.adminPassword="admin" \\
+                                                        --set wso2.apim.configurations.security.keystores.primary.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.primary.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.tls.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.tls.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.internal.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.internal.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.truststore.password="wso2carbon" \\
+                                                        --set wso2.deployment.resources.requests.cpu="1000m" \\
+                                                        --set wso2.apim.configurations.userStore.properties.ReadGroups=true \\
+                                                        --set kubernetes.ingress.controlPlane.hostname="${portalHost}" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].name="Default" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].type="hybrid" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].gatewayType="Regular" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].provider="wso2" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].displayInApiConsole=true \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].description="This is a hybrid gateway that handles both production and sandbox token traffic." \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].showAsTokenEndpointUrl=true \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].serviceName="apim-universal-gw-wso2am-universal-gw-service" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].servicePort=9443 \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].wsHostname="${wsHost}" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].httpHostname="${gwHost}" \\
+                                                        --set wso2.apim.configurations.gateway.environments[0].websubHostname="${websubHost}" \\
+                                                        --set wso2.apim.configurations.devportal.enableApplicationSharing=true \\
+                                                        --set wso2.apim.configurations.devportal.applicationSharingType="default" \\
+                                                        --set wso2.apim.configurations.oauth_config.oauth2JWKSUrl="https://apim-acp-wso2am-acp-service:9443/oauth2/jwks" \\
+                                                        --set wso2.deployment.image.registry="${dockerRegSafe}" \\
+                                                        --set wso2.deployment.image.repository="${project}-wso2am-acp:${acpImageTag}" \\
+                                                        --set wso2.deployment.image.digest="${wso2amAcpImageDigest}" \\
+                                                        --set wso2.deployment.image.imagePullSecrets.enabled=true \\
+                                                        --set wso2.deployment.image.imagePullSecrets.username="${dockerRegUserSafe}" \\
+                                                        --set wso2.deployment.image.imagePullSecrets.password="${dockerRegPassSafe}" \\
+                                                        --set wso2.apim.configurations.databases.type="${dbEngineList[dbEngineNameSafe].dbType}" \\
+                                                        --set wso2.apim.configurations.databases.jdbc.driver="${dbEngineList[dbEngineNameSafe].dbDriver}" \\
+                                                        --set wso2.apim.configurations.databases.apim_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/${apimDbName}?useSSL=false" \\
+                                                        --set wso2.apim.configurations.databases.apim_db.username="${dbUser}" \\
+                                                        --set wso2.apim.configurations.databases.apim_db.password="${dbPassword}" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/${sharedDbName}?useSSL=false" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.username="${dbUser}" \\
                                                         --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}"
                                                     
                                                     # Wait for the deployment to be ready
                                                     kubectl wait --for=condition=available --timeout=400s deployment/apim-acp-wso2am-acp-deployment-1 -n ${namespace}
 
-                                                    # Deploy wso2am-tm
-                                                    echo "Deploying WSO2 API Manager - Traffic Manager in ${namespace} namespace..."
-                                                    helm install apim-tm ${helmChartPath}/distributed/traffic-manager \
-                                                        --namespace ${namespace} \
-                                                        --set aws.enabled=false \
-                                                        --set wso2.apim.configurations.adminUsername="admin" \
-                                                        --set wso2.apim.configurations.adminPassword="admin" \
-                                                        --set wso2.apim.configurations.security.keystores.primary.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.primary.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.tls.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.tls.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.internal.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.internal.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.truststore.password="wso2carbon" \
-                                                        --set wso2.deployment.resources.requests.cpu="1000m" \
-                                                        --set wso2.apim.configurations.km.serviceUrl="apim-acp-wso2am-acp-service" \
-                                                        --set wso2.apim.configurations.eventhub.enabled=true \
-                                                        --set wso2.apim.configurations.eventhub.serviceUrl="apim-acp-wso2am-acp-service" \
-                                                        --set wso2.apim.configurations.eventhub.urls="{apim-acp-wso2am-acp-1-service,apim-acp-wso2am-acp-2-service}" \
-                                                        --set wso2.deployment.image.registry="${dockerRegistrySafe}" \
-                                                        --set wso2.deployment.image.repository="${project}-wso2am-tm:${dbEngineNameSafe}-latest" \
-                                                        --set wso2.deployment.image.digest=${wso2amTmImageDigest} \
-                                                        --set wso2.deployment.image.imagePullSecrets.enabled=true \
-                                                        --set wso2.deployment.image.imagePullSecrets.username="${dockerRegistryUsernameSafe}" \
-                                                        --set wso2.deployment.image.imagePullSecrets.password="${dockerRegistryPasswordSafe}" \
-                                                        --set wso2.apim.configurations.databases.type="${dbEngineList[dbEngineNameSafe].dbType}" \
-                                                        --set wso2.apim.configurations.databases.jdbc.driver="${dbEngineList[dbEngineNameSafe].dbDriver}" \
-                                                        --set wso2.apim.configurations.databases.apim_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/apim_db?useSSL=false" \
-                                                        --set wso2.apim.configurations.databases.apim_db.username="${dbUser}" \
-                                                        --set wso2.apim.configurations.databases.apim_db.password="${dbPassword}" \
-                                                        --set wso2.apim.configurations.databases.shared_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/shared_db?useSSL=false" \
-                                                        --set wso2.apim.configurations.databases.shared_db.username="${dbUser}" \
+                                                    # Deploy wso2am-tm (variant: ${dpSafe.tmVariant})
+                                                    echo "Deploying WSO2 API Manager - Traffic Manager [${dpSafe.tmVariant}] in ${namespace} namespace..."
+                                                    helm install apim-tm ${helmChartPath}/distributed/traffic-manager \\
+                                                        --namespace ${namespace} \\
+                                                        --set aws.enabled=false \\
+                                                        --set wso2.apim.configurations.adminUsername="admin" \\
+                                                        --set wso2.apim.configurations.adminPassword="admin" \\
+                                                        --set wso2.apim.configurations.security.keystores.primary.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.primary.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.tls.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.tls.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.internal.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.internal.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.truststore.password="wso2carbon" \\
+                                                        --set wso2.deployment.resources.requests.cpu="1000m" \\
+                                                        --set wso2.apim.configurations.km.serviceUrl="apim-acp-wso2am-acp-service" \\
+                                                        --set wso2.apim.configurations.eventhub.enabled=true \\
+                                                        --set wso2.apim.configurations.eventhub.serviceUrl="apim-acp-wso2am-acp-service" \\
+                                                        --set wso2.apim.configurations.eventhub.urls="{apim-acp-wso2am-acp-1-service,apim-acp-wso2am-acp-2-service}" \\
+                                                        --set wso2.deployment.image.registry="${dockerRegSafe}" \\
+                                                        --set wso2.deployment.image.repository="${project}-wso2am-tm:${tmImageTag}" \\
+                                                        --set wso2.deployment.image.digest=${wso2amTmImageDigest} \\
+                                                        --set wso2.deployment.image.imagePullSecrets.enabled=true \\
+                                                        --set wso2.deployment.image.imagePullSecrets.username="${dockerRegUserSafe}" \\
+                                                        --set wso2.deployment.image.imagePullSecrets.password="${dockerRegPassSafe}" \\
+                                                        --set wso2.apim.configurations.databases.type="${dbEngineList[dbEngineNameSafe].dbType}" \\
+                                                        --set wso2.apim.configurations.databases.jdbc.driver="${dbEngineList[dbEngineNameSafe].dbDriver}" \\
+                                                        --set wso2.apim.configurations.databases.apim_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/${apimDbName}?useSSL=false" \\
+                                                        --set wso2.apim.configurations.databases.apim_db.username="${dbUser}" \\
+                                                        --set wso2.apim.configurations.databases.apim_db.password="${dbPassword}" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/${sharedDbName}?useSSL=false" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.username="${dbUser}" \\
                                                         --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}"
 
                                                     # Wait for the deployment to be ready
                                                     kubectl wait --for=condition=available --timeout=400s deployment/apim-tm-wso2am-tm-deployment-1 -n ${namespace}
 
-                                                    # Deploy wso2am-gw
-                                                    echo "Deploying WSO2 API Manager - Gateway in ${namespace} namespace..."
-                                                    helm install apim-universal-gw ${helmChartPath}/distributed/gateway \
-                                                        --namespace ${namespace} \
-                                                        --set aws.enabled=false \
-                                                        --set wso2.apim.configurations.adminUsername="admin" \
-                                                        --set wso2.apim.configurations.adminPassword="admin" \
-                                                        --set wso2.apim.configurations.security.keystores.primary.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.primary.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.tls.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.tls.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.internal.password="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.keystores.internal.keyPassword="wso2carbon" \
-                                                        --set wso2.apim.configurations.security.truststore.password="wso2carbon" \
-                                                        --set wso2.deployment.resources.requests.cpu="1000m" \
-                                                        --set kubernetes.ingress.gateway.hostname="gw-${dbEngineNameSafe}.wso2.com" \
-                                                        --set kubernetes.ingress.websocket.hostname="websocket-${dbEngineNameSafe}.wso2.com" \
-                                                        --set kubernetes.ingress.websub.hostname="websub-${dbEngineNameSafe}.wso2.com" \
-                                                        --set wso2.apim.configurations.km.serviceUrl="apim-acp-wso2am-acp-service" \
-                                                        --set wso2.apim.configurations.throttling.serviceUrl="apim-tm-wso2am-tm-service" \
-                                                        --set wso2.apim.configurations.throttling.urls="{apim-tm-wso2am-tm-1-service,apim-tm-wso2am-tm-2-service}" \
-                                                        --set wso2.apim.configurations.eventhub.enabled=true \
-                                                        --set wso2.apim.configurations.eventhub.serviceUrl="apim-acp-wso2am-acp-service" \
-                                                        --set wso2.apim.configurations.eventhub.urls="{apim-acp-wso2am-acp-1-service,apim-acp-wso2am-acp-2-service}" \
-                                                        --set wso2.deployment.image.registry="${dockerRegistrySafe}" \
-                                                        --set wso2.deployment.image.repository="${project}-wso2am-universal-gw:${dbEngineNameSafe}-latest" \
-                                                        --set wso2.deployment.image.digest=${wso2amGwImageDigest} \
-                                                        --set wso2.deployment.image.imagePullSecrets.enabled=true \
-                                                        --set wso2.deployment.image.imagePullSecrets.username="${dockerRegistryUsernameSafe}" \
-                                                        --set wso2.deployment.image.imagePullSecrets.password="${dockerRegistryPasswordSafe}" \
-                                                        --set wso2.apim.configurations.databases.type="${dbEngineList[dbEngineNameSafe].dbType}" \
-                                                        --set wso2.apim.configurations.databases.jdbc.driver="${dbEngineList[dbEngineNameSafe].dbDriver}" \
-                                                        --set wso2.apim.configurations.databases.shared_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/shared_db?useSSL=false" \
-                                                        --set wso2.apim.configurations.databases.shared_db.username="${dbUser}" \
-                                                        --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}" \
-                                                        --set wso2.deployment.replicas=2 \
+                                                    # Deploy wso2am-gw (variant: ${dpSafe.gwVariant})
+                                                    echo "Deploying WSO2 API Manager - Gateway [${dpSafe.gwVariant}] in ${namespace} namespace..."
+                                                    helm install apim-universal-gw ${helmChartPath}/distributed/gateway \\
+                                                        --namespace ${namespace} \\
+                                                        --set aws.enabled=false \\
+                                                        --set wso2.apim.configurations.adminUsername="admin" \\
+                                                        --set wso2.apim.configurations.adminPassword="admin" \\
+                                                        --set wso2.apim.configurations.security.keystores.primary.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.primary.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.tls.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.tls.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.internal.password="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.keystores.internal.keyPassword="wso2carbon" \\
+                                                        --set wso2.apim.configurations.security.truststore.password="wso2carbon" \\
+                                                        --set wso2.deployment.resources.requests.cpu="1000m" \\
+                                                        --set kubernetes.ingress.gateway.hostname="${gwHost}" \\
+                                                        --set kubernetes.ingress.websocket.hostname="${wsHost}" \\
+                                                        --set kubernetes.ingress.websub.hostname="${websubHost}" \\
+                                                        --set wso2.apim.configurations.km.serviceUrl="apim-acp-wso2am-acp-service" \\
+                                                        --set wso2.apim.configurations.throttling.serviceUrl="apim-tm-wso2am-tm-service" \\
+                                                        --set wso2.apim.configurations.throttling.urls="{apim-tm-wso2am-tm-1-service,apim-tm-wso2am-tm-2-service}" \\
+                                                        --set wso2.apim.configurations.eventhub.enabled=true \\
+                                                        --set wso2.apim.configurations.eventhub.serviceUrl="apim-acp-wso2am-acp-service" \\
+                                                        --set wso2.apim.configurations.eventhub.urls="{apim-acp-wso2am-acp-1-service,apim-acp-wso2am-acp-2-service}" \\
+                                                        --set wso2.deployment.image.registry="${dockerRegSafe}" \\
+                                                        --set wso2.deployment.image.repository="${project}-wso2am-universal-gw:${gwImageTag}" \\
+                                                        --set wso2.deployment.image.digest=${wso2amGwImageDigest} \\
+                                                        --set wso2.deployment.image.imagePullSecrets.enabled=true \\
+                                                        --set wso2.deployment.image.imagePullSecrets.username="${dockerRegUserSafe}" \\
+                                                        --set wso2.deployment.image.imagePullSecrets.password="${dockerRegPassSafe}" \\
+                                                        --set wso2.apim.configurations.databases.type="${dbEngineList[dbEngineNameSafe].dbType}" \\
+                                                        --set wso2.apim.configurations.databases.jdbc.driver="${dbEngineList[dbEngineNameSafe].dbDriver}" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.url="jdbc:${dbEngineList[dbEngineNameSafe].dbType}://${endpoint}:${dbPort}/${sharedDbName}?useSSL=false" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.username="${dbUser}" \\
+                                                        --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}" \\
+                                                        --set wso2.deployment.replicas=2 \\
                                                         --set wso2.deployment.minReplicas=2
                                                     
                                                     # Wait for the deployment to be ready
@@ -780,8 +870,8 @@ pipeline {
                                             }
                                         }
                                     } catch (Exception e) {
-                                        println "Deployment failed for ${patternDirSafe}-${dbEngineNameSafe}: ${e}"
-                                        error "Deployment failed for ${patternDirSafe}-${dbEngineNameSafe}. Please check the logs for more details."
+                                        println "Deployment failed for ${stageId}: ${e}"
+                                        error "Deployment failed for ${stageId}. Please check the logs for more details."
                                     }
                                 }
 
@@ -799,20 +889,23 @@ pipeline {
                                                 secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                                             ]
                                         ]) {
-                                            String namespace = "${patternSafe.id}-${dbEngineNameSafe}"
+                                            def namespace = (deploymentPatterns.size() > 1) ? "${infraConfig.id}-${dbEngineNameSafe}-${dpName}" : "${infraConfig.id}-${dbEngineNameSafe}"
+                                            def portalHost = (deploymentPatterns.size() > 1) ? "am-${dbEngineNameSafe}-${dpName}.wso2.com" : "am-${dbEngineNameSafe}.wso2.com"
+                                            def gwHost     = (deploymentPatterns.size() > 1) ? "gw-${dbEngineNameSafe}-${dpName}.wso2.com" : "gw-${dbEngineNameSafe}.wso2.com"
+
                                             dir("${apimIntgDirectory}") {
                                                 sh """
                                                     # Change context
-                                                    kubectl config use-context ${patternDirSafe}
+                                                    kubectl config use-context ${infraDirSafe}
                                                 """
 
-                                                echo "Waiting 60 seconds before proceeding with tests for ${patternDirSafe} with ${dbEngineNameSafe}..."
+                                                echo "Waiting 60 seconds before proceeding with tests for ${stageId}..."
                                                 sleep 60
 
                                                 sh """
-                                                    ./main.sh --HOSTNAME="${patternSafe.hostName}" \
-                                                        --PORTAL_HOST="am-${dbEngineNameSafe}.wso2.com" \
-                                                        --GATEWAY_HOST="gw-${dbEngineNameSafe}.wso2.com" \
+                                                    ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
+                                                        --PORTAL_HOST="${portalHost}" \\
+                                                        --GATEWAY_HOST="${gwHost}" \\
                                                         --kubernetes_namespace="${namespace}"
                                                 """
                                             }
@@ -821,11 +914,12 @@ pipeline {
                                                 def podNames = sh(
                                                     script: "kubectl get pods -l product=apim -n=${namespace} -o custom-columns=:metadata.name",
                                                     returnStdout: true
-                                                ).trim().split('\n')
+                                                ).trim().split('\\n')
                                                 println "APIM pods in namespace ${namespace}: ${podNames}"
                                                 for (def podName : podNames) {
                                                     if (podName?.trim()) {
-                                                        def logFile = "${dbEngineNameSafe}-${podName}.log"
+                                                        // Log filename includes deployment pattern name for traceability
+                                                        def logFile = "${dpName}-${dbEngineNameSafe}-${podName}.log"
                                                         sh """
                                                             kubectl logs ${podName} -n=${namespace} > ${logFile} || echo "Failed to get logs for pod ${podName}"
                                                         """
@@ -835,15 +929,15 @@ pipeline {
                                             }
                                         }
                                     } catch (Exception e) {
-                                        println "Test execution failed for ${patternDirSafe}-${dbEngineNameSafe}: ${e}"
-                                        error "Test execution failed for ${patternDirSafe}-${dbEngineNameSafe}. Please check the logs for more details."
+                                        println "Test execution failed for ${stageId}: ${e}"
+                                        error "Test execution failed for ${stageId}. Please check the logs for more details."
                                     }
                                 }
                             }
                         }
                     }
                     
-                    // Run all stages in parallel
+                    // Run all deployment patterns in parallel
                     parallel parallelDeployments
                 }
             }
@@ -863,31 +957,29 @@ pipeline {
                             secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
                         ]]) { 
                             println "Destroying cloud resources!"
-                            // Destroy the created resources
-                            for (def pattern : deploymentPatterns) {
-                                def deploymentDirName = pattern.directory
-                                dir("${deploymentDirName}") {
-                                    println "Destroying resources for ${deploymentDirName}..."
-                                    sh """
-                                        # Configure EKS cluster
-                                        aws eks --region ${productDeploymentRegion} \
-                                        update-kubeconfig --name ${project}-${pattern.id}-${tfEnvironment}-${productDeploymentRegion}-eks \
-                                        --alias ${pattern.directory} || echo "Failed to update kubeconfig."
+                            // Destroy the created resources (single infra)
+                            def deploymentDirName = infraConfig.directory
+                            dir("${deploymentDirName}") {
+                                println "Destroying resources for ${deploymentDirName}..."
+                                sh """
+                                    # Configure EKS cluster
+                                    aws eks --region ${productDeploymentRegion} \
+                                    update-kubeconfig --name ${project}-${infraConfig.id}-${tfEnvironment}-${productDeploymentRegion}-eks \
+                                    --alias ${infraConfig.directory} || echo "Failed to update kubeconfig."
 
-                                        kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.0.4/deploy/static/provider/aws/deploy.yaml || echo "Failed to delete ingress controller."
+                                    kubectl delete -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.0.4/deploy/static/provider/aws/deploy.yaml || echo "Failed to delete ingress controller."
 
-                                        kubectl wait --namespace ingress-nginx --for=delete pod --selector=app.kubernetes.io/component=controller --timeout=480s || echo "Ingress controller pods were not deleted within the expected time limit."
+                                    kubectl wait --namespace ingress-nginx --for=delete pod --selector=app.kubernetes.io/component=controller --timeout=480s || echo "Ingress controller pods were not deleted within the expected time limit."
 
-                                        terraform destroy -auto-approve \
-                                            -var="project=${project}" \
-                                            -var="client_name=${pattern.id}" \
-                                            -var="region=${productDeploymentRegion}" \
-                                            -var='db_engine_options=${pattern.dbEnginesJson}' \
-                                            -var="db_password=$dbPassword" \
-                                            -var="eks_default_nodepool_desired_size=${pattern.eksDesiredSize}" \
-                                            -no-color
-                                    """
-                                }
+                                    terraform destroy -auto-approve \
+                                        -var="project=${project}" \
+                                        -var="client_name=${infraConfig.id}" \
+                                        -var="region=${productDeploymentRegion}" \
+                                        -var='db_engine_options=${infraConfig.dbEnginesJson}' \
+                                        -var="db_password=$dbPassword" \
+                                        -var="eks_default_nodepool_desired_size=${infraConfig.eksDesiredSize}" \
+                                        -no-color
+                                """
                             }
                         }
                     }
