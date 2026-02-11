@@ -899,8 +899,25 @@ pipeline {
                                                     kubectl config use-context ${infraDirSafe}
                                                 """
 
-                                                echo "Waiting 60 seconds before proceeding with tests for ${stageId}..."
-                                                sleep 60
+                                                echo "Waiting for ACP DCR endpoint to be ready for ${stageId}..."
+                                                sh """
+                                                    # Retry loop: Wait up to 5 minutes (30 * 10s) for DCR to return a valid status (2xx, 3xx, 4xx)
+                                                    for i in {1..30}; do
+                                                        # Hit the DCR endpoint via the LoadBalancer with the correct Host Header
+                                                        # We accept 401/400 because that means the App is UP and processing auth (unlike 500 which means it is broken)
+                                                        STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k -H "Host: ${portalHost}" https://${infraConfig.hostName}/client-registration/v0.17/register)
+
+                                                        echo "Readiness Check \$i: DCR endpoint returned HTTP \$STATUS"
+
+                                                        if [[ "\$STATUS" =~ ^[234] ]]; then
+                                                            echo "ACP DCR endpoint is ready (HTTP \$STATUS)! Proceeding..."
+                                                            break
+                                                        fi
+
+                                                        echo "ACP not ready yet. Waiting 10s..."
+                                                        sleep 10
+                                                    done
+                                                """
 
                                                 sh """
                                                     ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
