@@ -612,6 +612,14 @@ pipeline {
                                     username: "AWS",
                                     password: password
                                 ]
+
+                                // Download keystore files ONCE before parallel deployments
+                                // to prevent race conditions from concurrent S3 downloads.
+                                sh """
+                                    aws s3 cp --quiet s3://${tfS3Bucket}/tools/client-truststore.jks .
+                                    aws s3 cp --quiet s3://${tfS3Bucket}/tools/wso2carbon.jks .
+                                """
+                                println "Keystore files downloaded to ${deploymentDirName}/"
                             }
                         }
                     } catch (Exception e) {
@@ -777,26 +785,20 @@ pipeline {
                                                 def websubHost = "websub-${hostSuffix}.wso2.com"
 
                                                 sh """
-                                                    # Change context
-                                                    kubectl config use-context ${infraDirSafe}
-
                                                     # Create a namespace for the deployment
-                                                    kubectl create namespace ${namespace} || echo "Namespace ${namespace} already exists."
+                                                    kubectl --context=${infraDirSafe} create namespace ${namespace} || echo "Namespace ${namespace} already exists."
 
-                                                    aws s3 cp --quiet s3://${tfS3Bucket}/tools/client-truststore.jks .
-                                                    aws s3 cp --quiet s3://${tfS3Bucket}/tools/wso2carbon.jks .
-
-                                                    # Create apim-keystore-secret
-                                                    kubectl create secret generic apim-keystore-secret --from-file=wso2carbon.jks --from-file=client-truststore.jks -n ${namespace} || echo "Failed to create apim-keystore-secret."
+                                                    # Create apim-keystore-secret from pre-downloaded keystore files
+                                                    kubectl --context=${infraDirSafe} create secret generic apim-keystore-secret --from-file=wso2carbon.jks --from-file=client-truststore.jks -n ${namespace} || echo "Failed to create apim-keystore-secret."
                                                 """
                                                 println "Namespace created: ${namespace}"
 
                                                 sh """
                                                 # Delete existing release if it exists
-                                                helm list -n ${namespace} -q | xargs -n1 -I{} helm uninstall {} -n ${namespace} || echo "Failed to delete existing release."
+                                                helm --kube-context=${infraDirSafe} list -n ${namespace} -q | xargs -n1 -I{} helm --kube-context=${infraDirSafe} uninstall {} -n ${namespace} || echo "Failed to delete existing release."
 
                                                 # Delete gateway REST ingress if it exists
-                                                kubectl delete ingress gw-rest-ingress -n ${namespace} || echo "Skipped deleting existing ingress."
+                                                kubectl --context=${infraDirSafe} delete ingress gw-rest-ingress -n ${namespace} || echo "Skipped deleting existing ingress."
                                                 """
 
                                                 // Fetch image digests using variant-specific tags
@@ -813,13 +815,13 @@ pipeline {
                                                 // Install the product using Helm
                                                 sh """
                                                     # Gateway REST ingress
-                                                    helm install apim-ing ${pwd}/${apimIntgDirectory}/kubernetes/gw-ingress \\
+                                                    helm --kube-context=${infraDirSafe} install apim-ing ${pwd}/${apimIntgDirectory}/kubernetes/gw-ingress \\
                                                         --set hostname=${gwHost} \\
                                                         --namespace ${namespace}
                                                     
                                                     # Deploy wso2am-acp (variant: ${dpSafe.acpVariant})
                                                     echo "Deploying WSO2 API Manager - API Control Plane [${dpSafe.acpVariant}] in ${namespace} namespace..."
-                                                    helm install apim-acp ${helmChartPath}/distributed/control-plane \\
+                                                    helm --kube-context=${infraDirSafe} install apim-acp ${helmChartPath}/distributed/control-plane \\
                                                         --namespace ${namespace} \\
                                                         --set aws.enabled=false \\
                                                         --set wso2.apim.configurations.adminUsername="admin" \\
@@ -865,11 +867,11 @@ pipeline {
                                                         --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}"
                                                     
                                                     # Wait for the deployment to be ready
-                                                    kubectl wait --for=condition=available --timeout=400s deployment/apim-acp-wso2am-acp-deployment-1 -n ${namespace}
+                                                    kubectl --context=${infraDirSafe} wait --for=condition=available --timeout=400s deployment/apim-acp-wso2am-acp-deployment-1 -n ${namespace}
 
                                                     # Deploy wso2am-tm (variant: ${dpSafe.tmVariant})
                                                     echo "Deploying WSO2 API Manager - Traffic Manager [${dpSafe.tmVariant}] in ${namespace} namespace..."
-                                                    helm install apim-tm ${helmChartPath}/distributed/traffic-manager \\
+                                                    helm --kube-context=${infraDirSafe} install apim-tm ${helmChartPath}/distributed/traffic-manager \\
                                                         --namespace ${namespace} \\
                                                         --set aws.enabled=false \\
                                                         --set wso2.apim.configurations.adminUsername="admin" \\
@@ -902,11 +904,11 @@ pipeline {
                                                         --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}"
 
                                                     # Wait for the deployment to be ready
-                                                    kubectl wait --for=condition=available --timeout=400s deployment/apim-tm-wso2am-tm-deployment-1 -n ${namespace}
+                                                    kubectl --context=${infraDirSafe} wait --for=condition=available --timeout=400s deployment/apim-tm-wso2am-tm-deployment-1 -n ${namespace}
 
                                                     # Deploy wso2am-gw (variant: ${dpSafe.gwVariant})
                                                     echo "Deploying WSO2 API Manager - Gateway [${dpSafe.gwVariant}] in ${namespace} namespace..."
-                                                    helm install apim-universal-gw ${helmChartPath}/distributed/gateway \\
+                                                    helm --kube-context=${infraDirSafe} install apim-universal-gw ${helmChartPath}/distributed/gateway \\
                                                         --namespace ${namespace} \\
                                                         --set aws.enabled=false \\
                                                         --set wso2.apim.configurations.adminUsername="admin" \\
@@ -943,7 +945,7 @@ pipeline {
                                                         --set wso2.deployment.minReplicas=2
                                                     
                                                     # Wait for the deployment to be ready
-                                                    kubectl wait --for=condition=ready --timeout=300s pod -l deployment=apim-universal-gw-wso2am-universal-gw -n ${namespace}
+                                                    kubectl --context=${infraDirSafe} wait --for=condition=ready --timeout=300s pod -l deployment=apim-universal-gw-wso2am-universal-gw -n ${namespace}
                                                 """
                                             }
                                         }
@@ -971,12 +973,12 @@ pipeline {
                                             def portalHost = (deploymentPatterns.size() > 1) ? "am-${dbEngineNameSafe}-${dpName}.wso2.com" : "am-${dbEngineNameSafe}.wso2.com"
                                             def gwHost     = (deploymentPatterns.size() > 1) ? "gw-${dbEngineNameSafe}-${dpName}.wso2.com" : "gw-${dbEngineNameSafe}.wso2.com"
 
-                                            dir("${apimIntgDirectory}") {
-                                                sh """
-                                                    # Change context
-                                                    kubectl config use-context ${infraDirSafe}
-                                                """
+                                            // Create an isolated copy of the test directory for this pattern
+                                            // to prevent concurrent main.sh / Newman runs from colliding.
+                                            def testDir = "${apimIntgDirectory}-${dpName}"
+                                            sh "cp -r ${apimIntgDirectory} ${testDir}"
 
+                                            dir("${testDir}") {
                                                 echo "Waiting for DCR endpoint to be ready for ${stageId}..."
                                                 waitForDcrEndpoint(infraConfig.hostName, portalHost)
 
@@ -993,7 +995,7 @@ pipeline {
 
                                             dir("${logsDirectory}") {
                                                 def podNames = sh(
-                                                    script: "kubectl get pods -l product=apim -n=${namespace} -o custom-columns=:metadata.name",
+                                                    script: "kubectl --context=${infraDirSafe} get pods -l product=apim -n=${namespace} -o custom-columns=:metadata.name",
                                                     returnStdout: true
                                                 ).trim().split('\\n')
                                                 println "APIM pods in namespace ${namespace}: ${podNames}"
@@ -1002,7 +1004,7 @@ pipeline {
                                                         // Log filename includes deployment pattern name for traceability
                                                         def logFile = "${dpName}-${dbEngineNameSafe}-${podName}.log"
                                                         sh """
-                                                            kubectl logs ${podName} -n=${namespace} > ${logFile} || echo "Failed to get logs for pod ${podName}"
+                                                            kubectl --context=${infraDirSafe} logs ${podName} -n=${namespace} > ${logFile} || echo "Failed to get logs for pod ${podName}"
                                                         """
                                                     }
                                                 }
