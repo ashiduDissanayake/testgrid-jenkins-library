@@ -142,6 +142,84 @@ def initInfraConfig(String project, String product, String productVersion,
     infraConfig.eksDesiredSize = nodesPerNamespace * dbEngines.size() * deploymentPatternCount
 }
 
+def getDbNames(String dbSuffix) {
+    String sharedDbName = dbSuffix ? "shared_db_${dbSuffix}" : "shared_db"
+    String apimDbName   = dbSuffix ? "apim_db_${dbSuffix}"   : "apim_db"
+    return [sharedDbName, apimDbName]
+}
+
+/**
+ * Wait for the DCR (Dynamic Client Registration) endpoint to become ready.
+ * Sends a real POST with Basic auth (admin:admin) and an empty JSON body.
+ * A fully initialized DCR returns 400 (bad request — missing required fields).
+ * A still-initializing DCR returns 500; a connection failure returns 000.
+ * HTTP 400 and 201 are treated as "ready" (both prove the webapp is
+ * initialized). Other 4xx (404, 405) indicate a misconfigured route or
+ * method and are not accepted.
+ *
+ * @param hostName   The ingress/service hostname to connect to.
+ * @param portalHost The Host header value for the request.
+ * @param maxAttempts Maximum number of retry attempts (default 30).
+ * @param waitSeconds Seconds to wait between attempts (default 10).
+ */
+def waitForDcrEndpoint(String hostName, String portalHost, int maxAttempts = 30, int waitSeconds = 10) {
+    sh """#!/bin/bash
+        for i in \$(seq 1 ${maxAttempts}); do
+            STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 10 --max-time 30 \\
+                -X POST \\
+                -H "Host: ${portalHost}" \\
+                -H "Content-Type: application/json" \\
+                -H "Authorization: Basic YWRtaW46YWRtaW4=" \\
+                -d '{}' \\
+                https://${hostName}/client-registration/v0.17/register)
+            echo "Readiness Check \$i: DCR endpoint returned HTTP \$STATUS"
+            if [[ "\$STATUS" == "400" || "\$STATUS" == "201" ]]; then
+                echo "DCR endpoint is ready (HTTP \$STATUS)! Proceeding..."
+                break
+            fi
+            echo "DCR endpoint not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
+            sleep ${waitSeconds}
+        done
+
+        if [[ "\$STATUS" != "400" && "\$STATUS" != "201" ]]; then
+            echo "ERROR: DCR endpoint did not become ready after ${maxAttempts} attempts. Aborting tests."
+            exit 1
+        fi
+    """
+}
+
+/**
+ * Wait for the Publisher REST API to become ready.
+ * Sends an unauthenticated GET to the Publisher APIs listing endpoint.
+ * A ready Publisher returns 401 (Unauthorized). A still-initializing
+ * webapp returns 500 or 000. Only 200, 401, and 403 are accepted as
+ * "ready"; 404 (route not registered) and 302 (redirect) are not.
+ *
+ * @param hostName   The ingress/service hostname to connect to.
+ * @param portalHost The Host header value for the request.
+ * @param maxAttempts Maximum number of retry attempts (default 30).
+ * @param waitSeconds Seconds to wait between attempts (default 10).
+ */
+def waitForPublisherApi(String hostName, String portalHost, int maxAttempts = 30, int waitSeconds = 10) {
+    sh """#!/bin/bash
+        for i in \$(seq 1 ${maxAttempts}); do
+            STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 10 --max-time 30 -H "Host: ${portalHost}" https://${hostName}/api/am/publisher/v4/apis)
+            echo "Readiness Check \$i: Publisher API returned HTTP \$STATUS"
+            if [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
+                echo "Publisher API is ready (HTTP \$STATUS)! Proceeding..."
+                break
+            fi
+            echo "Publisher API not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
+            sleep ${waitSeconds}
+        done
+
+        if ! [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
+            echo "ERROR: Publisher API did not become ready after ${maxAttempts} attempts. Aborting tests."
+            exit 1
+        fi
+    """
+}
+
 /**
  * Execute DB scripts to create and initialise databases.
  * @param dbSuffix  Suffix for unique DB names per test pattern (e.g. "all_staging").
@@ -726,8 +804,6 @@ pipeline {
                                                 String wso2amTmImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-tm --query 'imageDetails[?contains(imageTags, `${tmImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
                                                 String wso2amGwImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-universal-gw --query 'imageDetails[?contains(imageTags, `${gwImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
 
-                                                sleep 60
-
                                                 // Execute DB scripts with per-pattern database names
                                                 executeDBScripts(dbEngineNameSafe, endpoint, dbUser, dbPassword, "${pwd}/${apimIntgDirectory}", dbSuffix)
 
@@ -899,25 +975,11 @@ pipeline {
                                                     kubectl config use-context ${infraDirSafe}
                                                 """
 
-                                                echo "Waiting for ACP DCR endpoint to be ready for ${stageId}..."
-                                                sh """
-                                                    # Retry loop: Wait up to 5 minutes (30 * 10s) for DCR to return a valid status (2xx, 3xx, 4xx)
-                                                    for i in {1..30}; do
-                                                        # Hit the DCR endpoint via the LoadBalancer with the correct Host Header
-                                                        # We accept 401/400 because that means the App is UP and processing auth (unlike 500 which means it is broken)
-                                                        STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k -H "Host: ${portalHost}" https://${infraConfig.hostName}/client-registration/v0.17/register)
+                                                echo "Waiting for DCR endpoint to be ready for ${stageId}..."
+                                                waitForDcrEndpoint(infraConfig.hostName, portalHost)
 
-                                                        echo "Readiness Check \$i: DCR endpoint returned HTTP \$STATUS"
-
-                                                        if [[ "\$STATUS" =~ ^[234] ]]; then
-                                                            echo "ACP DCR endpoint is ready (HTTP \$STATUS)! Proceeding..."
-                                                            break
-                                                        fi
-
-                                                        echo "ACP not ready yet. Waiting 10s..."
-                                                        sleep 10
-                                                    done
-                                                """
+                                                echo "Waiting for Publisher API to be ready for ${stageId}..."
+                                                waitForPublisherApi(infraConfig.hostName, portalHost)
 
                                                 sh """
                                                     ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
