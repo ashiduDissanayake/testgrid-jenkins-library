@@ -221,6 +221,44 @@ def waitForPublisherApi(String hostName, String portalHost, int maxAttempts = 30
 }
 
 /**
+ * Wait for the Gateway REST API to become ready.
+ * Sends an unauthenticated GET to the Gateway APIs listing endpoint
+ * through the gateway ingress hostname. A ready Gateway returns 401
+ * (Unauthorized) or 200. A still-initializing Gateway returns 500 or
+ * 000 (connection refused). Only 200, 401, and 403 are accepted as
+ * "ready"; 404 (route not registered) and 302 (redirect) are not.
+ *
+ * This check is critical for parallel peer-test runs where resource
+ * contention can delay Gateway pod startup compared to ACP pods.
+ * Without it, Newman tests may hit a Gateway that is not yet serving
+ * traffic, causing spurious 404 failures on API invocations.
+ *
+ * @param hostName   The ingress/service hostname (ELB) to connect to.
+ * @param gwHost     The Gateway Host header value for the request.
+ * @param maxAttempts Maximum number of retry attempts (default 30).
+ * @param waitSeconds Seconds to wait between attempts (default 10).
+ */
+def waitForGatewayApi(String hostName, String gwHost, int maxAttempts = 30, int waitSeconds = 10) {
+    sh """#!/bin/bash
+        for i in \$(seq 1 ${maxAttempts}); do
+            STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 10 --max-time 30 -H "Host: ${gwHost}" https://${hostName}/api/am/gateway/v2/apis)
+            echo "Readiness Check \$i: Gateway API returned HTTP \$STATUS"
+            if [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
+                echo "Gateway API is ready (HTTP \$STATUS)! Proceeding..."
+                break
+            fi
+            echo "Gateway API not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
+            sleep ${waitSeconds}
+        done
+
+        if ! [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
+            echo "ERROR: Gateway API did not become ready after ${maxAttempts} attempts. Aborting tests."
+            exit 1
+        fi
+    """
+}
+
+/**
  * Execute DB scripts to create and initialise databases.
  * @param dbSuffix  Suffix for unique DB names per test pattern (e.g. "all_staging").
  *                  Use empty string "" for single-pattern / custom mode (names stay shared_db, apim_db).
@@ -984,6 +1022,20 @@ pipeline {
 
                                                 echo "Waiting for Publisher API to be ready for ${stageId}..."
                                                 waitForPublisherApi(infraConfig.hostName, portalHost)
+
+                                                echo "Waiting for Gateway API to be ready for ${stageId}..."
+                                                waitForGatewayApi(infraConfig.hostName, gwHost)
+
+                                                // All HTTP endpoints are confirmed reachable, but
+                                                // under heavy parallel load the Gateway's internal
+                                                // JMS / EventHub subscriber threads may still be
+                                                // connecting to the Traffic Manager.  If Newman
+                                                // publishes APIs before those threads are ready the
+                                                // Gateway misses the JMS broadcast and returns 404
+                                                // on invocations.  A short buffer lets those
+                                                // background threads finish their handshake.
+                                                echo "All HTTP endpoints are ready. Waiting 60s for internal JMS/EventHub sync..."
+                                                sleep 60
 
                                                 sh """
                                                     ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
