@@ -804,6 +804,8 @@ pipeline {
                                                 String wso2amTmImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-tm --query 'imageDetails[?contains(imageTags, `${tmImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
                                                 String wso2amGwImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-universal-gw --query 'imageDetails[?contains(imageTags, `${gwImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
 
+                                                sleep 60
+
                                                 // Execute DB scripts with per-pattern database names
                                                 executeDBScripts(dbEngineNameSafe, endpoint, dbUser, dbPassword, "${pwd}/${apimIntgDirectory}", dbSuffix)
 
