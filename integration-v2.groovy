@@ -286,6 +286,54 @@ def waitForGatewayApi(String hostName, String gwHost, int maxAttempts = 45, int 
 }
 
 /**
+ * Wait until APIM pods are stable (all running/ready and no restart-count changes).
+ * This reduces flaky test starts when pods are still settling after rollout.
+ *
+ * @param kubeContext Kubernetes context name.
+ * @param namespace   Namespace that contains APIM pods.
+ * @param maxAttempts Max loop attempts (default 40).
+ * @param waitSeconds Sleep between attempts in seconds (default 15).
+ * @param requiredStableIterations Number of consecutive stable iterations (default 6).
+ */
+def waitForApimPodStability(String kubeContext, String namespace, int maxAttempts = 40, int waitSeconds = 15, int requiredStableIterations = 6) {
+    sh """#!/bin/bash
+        set -euo pipefail
+        stable_count=0
+        prev_restarts=""
+
+        for i in \$(seq 1 ${maxAttempts}); do
+            pod_snapshot=\$(kubectl --context=${kubeContext} get pods -n ${namespace} -l product=apim --no-headers || true)
+            total_count=\$(echo "\$pod_snapshot" | awk 'NF>0 {c++} END {print c+0}')
+            ready_count=\$(echo "\$pod_snapshot" | awk '\$2 == "1/1" && \$3 == "Running" {c++} END {print c+0}')
+            restart_snapshot=\$(kubectl --context=${kubeContext} get pods -n ${namespace} -l product=apim -o jsonpath='{range .items[*]}{.metadata.name}:{range .status.containerStatuses[*]}{.restartCount}{","}{end}{"\\n"}{end}' | sort || true)
+
+            echo "APIM stability check \$i: ready=\${ready_count}/\${total_count}"
+            echo "Restart snapshot: \${restart_snapshot}"
+
+            if [[ "\$total_count" -ge 6 && "\$ready_count" -eq "\$total_count" && "\$restart_snapshot" == "\$prev_restarts" ]]; then
+                stable_count=\$((stable_count + 1))
+                echo "Stable iteration streak: \${stable_count}/${requiredStableIterations}"
+            else
+                stable_count=0
+                prev_restarts="\$restart_snapshot"
+                echo "Pods not stable yet. Waiting ${waitSeconds}s..."
+            fi
+
+            if [[ \$stable_count -ge ${requiredStableIterations} ]]; then
+                echo "APIM pods are stable in namespace ${namespace}."
+                exit 0
+            fi
+
+            sleep ${waitSeconds}
+        done
+
+        echo "ERROR: APIM pods did not reach a stable state in namespace ${namespace}."
+        kubectl --context=${kubeContext} get pods -n ${namespace} -l product=apim -o wide || true
+        exit 1
+    """
+}
+
+/**
  * Execute DB scripts to create and initialise databases.
  * @param dbSuffix  Suffix for unique DB names per test pattern (e.g. "all_staging").
  *                  Use empty string "" for single-pattern / custom mode (names stay shared_db, apim_db).
@@ -856,21 +904,19 @@ pipeline {
                                                 def websubHost = "websub-${hostSuffix}.wso2.com"
 
                                                 sh """
-                                                    # Create a namespace for the deployment
-                                                    kubectl --context=${infraDirSafe} create namespace ${namespace} || echo "Namespace ${namespace} already exists."
+                                                    # Ensure a clean namespace to avoid state leaks across runs.
+                                                    if kubectl --context=${infraDirSafe} get namespace ${namespace} >/dev/null 2>&1; then
+                                                        echo "Namespace ${namespace} already exists. Deleting it for a clean deployment."
+                                                        kubectl --context=${infraDirSafe} delete namespace ${namespace} --timeout=600s
+                                                    fi
 
-                                                    # Create apim-keystore-secret from pre-downloaded keystore files
-                                                    kubectl --context=${infraDirSafe} create secret generic apim-keystore-secret --from-file=wso2carbon.jks --from-file=client-truststore.jks -n ${namespace} || echo "Failed to create apim-keystore-secret."
+                                                    # Create a fresh namespace for the deployment
+                                                    kubectl --context=${infraDirSafe} create namespace ${namespace}
+
+                                                    # Create/replace apim-keystore-secret from pre-downloaded keystore files
+                                                    kubectl --context=${infraDirSafe} create secret generic apim-keystore-secret --from-file=wso2carbon.jks --from-file=client-truststore.jks -n ${namespace} --dry-run=client -o yaml | kubectl --context=${infraDirSafe} apply -f -
                                                 """
                                                 println "Namespace created: ${namespace}"
-
-                                                sh """
-                                                # Delete existing release if it exists
-                                                helm --kube-context=${infraDirSafe} list -n ${namespace} -q | xargs -n1 -I{} helm --kube-context=${infraDirSafe} uninstall {} -n ${namespace} || echo "Failed to delete existing release."
-
-                                                # Delete gateway REST ingress if it exists
-                                                kubectl --context=${infraDirSafe} delete ingress gw-rest-ingress -n ${namespace} || echo "Skipped deleting existing ingress."
-                                                """
 
                                                 // Fetch image digests using variant-specific tags
                                                 String wso2amAcpImageDigest = sh(script: "aws ecr describe-images --repository-name ${project}-wso2am-acp --query 'imageDetails[?imageTags!=`null` && contains(imageTags, `${acpImageTag}`)].imageDigest' --region ${productDeploymentRegion} --output text", returnStdout: true).trim()
@@ -1053,6 +1099,9 @@ pipeline {
                                             sh "cp -r ${apimIntgDirectory} ${testDir}"
 
                                             dir("${testDir}") {
+                                                echo "Waiting for APIM pod stability for ${stageId}..."
+                                                waitForApimPodStability(infraDirSafe, namespace)
+
                                                 echo "Waiting for DCR endpoint to be ready for ${stageId}..."
                                                 waitForDcrEndpoint(infraConfig.hostName, portalHost)
 
@@ -1073,24 +1122,28 @@ pipeline {
                                                 echo "All HTTP endpoints are ready. Waiting 60s for internal JMS/EventHub sync..."
                                                 sleep 60
 
-                                                retry(2) {
-                                                    sh """#!/bin/bash
-                                                        set +e
-                                                        ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
-                                                            --PORTAL_HOST="${portalHost}" \\
-                                                            --GATEWAY_HOST="${gwHost}" \\
-                                                            --kubernetes_namespace="${namespace}"
-                                                        TEST_EXIT_CODE=\$?
-                                                        if [[ \$TEST_EXIT_CODE -ne 0 ]]; then
-                                                            echo "main.sh failed for ${stageId} with exit code \$TEST_EXIT_CODE. Capturing pod state before retry."
-                                                            kubectl --context=${infraDirSafe} get pods -n ${namespace} -o wide || true
-                                                            kubectl --context=${infraDirSafe} get events -n ${namespace} --sort-by=.metadata.creationTimestamp | tail -n 40 || true
-                                                            echo "Retrying after 45s cooldown..."
-                                                            sleep 45
-                                                        fi
-                                                        exit \$TEST_EXIT_CODE
-                                                    """
-                                                }
+                                                sh """#!/bin/bash
+                                                    set +e
+                                                    ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
+                                                        --PORTAL_HOST="${portalHost}" \\
+                                                        --GATEWAY_HOST="${gwHost}" \\
+                                                        --kubernetes_namespace="${namespace}"
+                                                    TEST_EXIT_CODE=\$?
+                                                    if [[ \$TEST_EXIT_CODE -ne 0 ]]; then
+                                                        echo "main.sh failed for ${stageId} with exit code \$TEST_EXIT_CODE. Capturing diagnostics."
+                                                        kubectl --context=${infraDirSafe} get pods -n ${namespace} -o wide || true
+                                                        kubectl --context=${infraDirSafe} get events -n ${namespace} --sort-by=.metadata.creationTimestamp | tail -n 80 || true
+
+                                                        echo "Describing APIM pods..."
+                                                        for p in \$(kubectl --context=${infraDirSafe} get pods -n ${namespace} -l product=apim -o jsonpath='{.items[*].metadata.name}'); do
+                                                            echo "========== kubectl describe pod \$p =========="
+                                                            kubectl --context=${infraDirSafe} describe pod \$p -n ${namespace} || true
+                                                            echo "========== kubectl logs --previous \$p =========="
+                                                            kubectl --context=${infraDirSafe} logs \$p -n ${namespace} --previous || true
+                                                        done
+                                                    fi
+                                                    exit \$TEST_EXIT_CODE
+                                                """
                                             }
 
                                             dir("${logsDirectory}") {
