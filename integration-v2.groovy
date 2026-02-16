@@ -626,6 +626,12 @@ pipeline {
                                     # Install nginx ingress controller
                                     kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.0.4/deploy/static/provider/aws/deploy.yaml || { echo "failed to install nginx ingress controller." ; exit 1 ; }
 
+                                    # Scale Nginx to handle parallel test traffic from multiple
+                                    # deployment patterns hitting the same ELB concurrently.
+                                    # A single replica becomes a bottleneck under 4-pattern
+                                    # parallel runs, causing intermittent 502 Bad Gateway errors.
+                                    kubectl -n ingress-nginx scale deployment ingress-nginx-controller --replicas=4
+
                                     # Delete Nginx admission if it exists.
                                     kubectl delete -A ValidatingWebhookConfiguration ingress-nginx-admission || echo "WARNING : Failed to delete nginx admission."
 
