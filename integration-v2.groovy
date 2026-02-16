@@ -913,8 +913,10 @@ pipeline {
                                                     # Create a fresh namespace for the deployment
                                                     kubectl --context=${infraDirSafe} create namespace ${namespace}
 
-                                                    # Create/replace apim-keystore-secret from pre-downloaded keystore files
-                                                    kubectl --context=${infraDirSafe} create secret generic apim-keystore-secret --from-file=wso2carbon.jks --from-file=client-truststore.jks -n ${namespace} --dry-run=client -o yaml | kubectl --context=${infraDirSafe} apply -f -
+                                                    # Recreate secret directly (no kubectl apply) to avoid oversized
+                                                    # last-applied annotation when keystore binaries are large.
+                                                    kubectl --context=${infraDirSafe} delete secret apim-keystore-secret -n ${namespace} --ignore-not-found
+                                                    kubectl --context=${infraDirSafe} create secret generic apim-keystore-secret --from-file=wso2carbon.jks --from-file=client-truststore.jks -n ${namespace}
                                                 """
                                                 println "Namespace created: ${namespace}"
 
