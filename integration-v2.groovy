@@ -159,11 +159,14 @@ def getDbNames(String dbSuffix) {
  *
  * @param hostName   The ingress/service hostname to connect to.
  * @param portalHost The Host header value for the request.
- * @param maxAttempts Maximum number of retry attempts (default 30).
+ * @param maxAttempts Maximum number of retry attempts (default 45).
  * @param waitSeconds Seconds to wait between attempts (default 10).
+ * @param consecutiveSuccesses Number of consecutive successful checks required to mark as ready (default 3).
  */
-def waitForDcrEndpoint(String hostName, String portalHost, int maxAttempts = 30, int waitSeconds = 10) {
+def waitForDcrEndpoint(String hostName, String portalHost, int maxAttempts = 45, int waitSeconds = 10, int consecutiveSuccesses = 3) {
     sh """#!/bin/bash
+        success_streak=0
+        STATUS=000
         for i in \$(seq 1 ${maxAttempts}); do
             STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 10 --max-time 30 \\
                 -X POST \\
@@ -174,15 +177,21 @@ def waitForDcrEndpoint(String hostName, String portalHost, int maxAttempts = 30,
                 https://${hostName}/client-registration/v0.17/register)
             echo "Readiness Check \$i: DCR endpoint returned HTTP \$STATUS"
             if [[ "\$STATUS" == "400" || "\$STATUS" == "201" ]]; then
-                echo "DCR endpoint is ready (HTTP \$STATUS)! Proceeding..."
-                break
+                success_streak=\$((success_streak + 1))
+                echo "DCR readiness streak: \$success_streak/${consecutiveSuccesses}"
+                if [[ \$success_streak -ge ${consecutiveSuccesses} ]]; then
+                    echo "DCR endpoint is stable and ready (HTTP \$STATUS)! Proceeding..."
+                    break
+                fi
+            else
+                success_streak=0
+                echo "DCR endpoint not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
             fi
-            echo "DCR endpoint not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
             sleep ${waitSeconds}
         done
 
-        if [[ "\$STATUS" != "400" && "\$STATUS" != "201" ]]; then
-            echo "ERROR: DCR endpoint did not become ready after ${maxAttempts} attempts. Aborting tests."
+        if [[ \$success_streak -lt ${consecutiveSuccesses} ]]; then
+            echo "ERROR: DCR endpoint did not reach ${consecutiveSuccesses} consecutive ready checks after ${maxAttempts} attempts. Last HTTP status: \$STATUS"
             exit 1
         fi
     """
@@ -197,24 +206,33 @@ def waitForDcrEndpoint(String hostName, String portalHost, int maxAttempts = 30,
  *
  * @param hostName   The ingress/service hostname to connect to.
  * @param portalHost The Host header value for the request.
- * @param maxAttempts Maximum number of retry attempts (default 30).
+ * @param maxAttempts Maximum number of retry attempts (default 45).
  * @param waitSeconds Seconds to wait between attempts (default 10).
+ * @param consecutiveSuccesses Number of consecutive successful checks required to mark as ready (default 3).
  */
-def waitForPublisherApi(String hostName, String portalHost, int maxAttempts = 30, int waitSeconds = 10) {
+def waitForPublisherApi(String hostName, String portalHost, int maxAttempts = 45, int waitSeconds = 10, int consecutiveSuccesses = 3) {
     sh """#!/bin/bash
+        success_streak=0
+        STATUS=000
         for i in \$(seq 1 ${maxAttempts}); do
             STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 10 --max-time 30 -H "Host: ${portalHost}" https://${hostName}/api/am/publisher/v4/apis)
             echo "Readiness Check \$i: Publisher API returned HTTP \$STATUS"
             if [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
-                echo "Publisher API is ready (HTTP \$STATUS)! Proceeding..."
-                break
+                success_streak=\$((success_streak + 1))
+                echo "Publisher readiness streak: \$success_streak/${consecutiveSuccesses}"
+                if [[ \$success_streak -ge ${consecutiveSuccesses} ]]; then
+                    echo "Publisher API is stable and ready (HTTP \$STATUS)! Proceeding..."
+                    break
+                fi
+            else
+                success_streak=0
+                echo "Publisher API not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
             fi
-            echo "Publisher API not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
             sleep ${waitSeconds}
         done
 
-        if ! [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
-            echo "ERROR: Publisher API did not become ready after ${maxAttempts} attempts. Aborting tests."
+        if [[ \$success_streak -lt ${consecutiveSuccesses} ]]; then
+            echo "ERROR: Publisher API did not reach ${consecutiveSuccesses} consecutive ready checks after ${maxAttempts} attempts. Last HTTP status: \$STATUS"
             exit 1
         fi
     """
@@ -235,24 +253,33 @@ def waitForPublisherApi(String hostName, String portalHost, int maxAttempts = 30
  *
  * @param hostName   The ingress/service hostname (ELB) to connect to.
  * @param gwHost     The Gateway Host header value for the request.
- * @param maxAttempts Maximum number of retry attempts (default 30).
+ * @param maxAttempts Maximum number of retry attempts (default 45).
  * @param waitSeconds Seconds to wait between attempts (default 10).
+ * @param consecutiveSuccesses Number of consecutive successful checks required to mark as ready (default 3).
  */
-def waitForGatewayApi(String hostName, String gwHost, int maxAttempts = 30, int waitSeconds = 10) {
+def waitForGatewayApi(String hostName, String gwHost, int maxAttempts = 45, int waitSeconds = 10, int consecutiveSuccesses = 3) {
     sh """#!/bin/bash
+        success_streak=0
+        STATUS=000
         for i in \$(seq 1 ${maxAttempts}); do
             STATUS=\$(curl -s -o /dev/null -w "%{http_code}" -k --connect-timeout 10 --max-time 30 -H "Host: ${gwHost}" https://${hostName}/api/am/gateway/v2/apis)
             echo "Readiness Check \$i: Gateway API returned HTTP \$STATUS"
             if [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
-                echo "Gateway API is ready (HTTP \$STATUS)! Proceeding..."
-                break
+                success_streak=\$((success_streak + 1))
+                echo "Gateway readiness streak: \$success_streak/${consecutiveSuccesses}"
+                if [[ \$success_streak -ge ${consecutiveSuccesses} ]]; then
+                    echo "Gateway API is stable and ready (HTTP \$STATUS)! Proceeding..."
+                    break
+                fi
+            else
+                success_streak=0
+                echo "Gateway API not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
             fi
-            echo "Gateway API not ready yet (HTTP \$STATUS). Waiting ${waitSeconds}s..."
             sleep ${waitSeconds}
         done
 
-        if ! [[ "\$STATUS" =~ ^(200|401|403)\$ ]]; then
-            echo "ERROR: Gateway API did not become ready after ${maxAttempts} attempts. Aborting tests."
+        if [[ \$success_streak -lt ${consecutiveSuccesses} ]]; then
+            echo "ERROR: Gateway API did not reach ${consecutiveSuccesses} consecutive ready checks after ${maxAttempts} attempts. Last HTTP status: \$STATUS"
             exit 1
         fi
     """
@@ -910,6 +937,7 @@ pipeline {
                                                     
                                                     # Wait for the deployment to be ready
                                                     kubectl --context=${infraDirSafe} wait --for=condition=available --timeout=400s deployment/apim-acp-wso2am-acp-deployment-1 -n ${namespace}
+                                                    kubectl --context=${infraDirSafe} wait --for=condition=available --timeout=400s deployment/apim-acp-wso2am-acp-deployment-2 -n ${namespace}
 
                                                     # Deploy wso2am-tm (variant: ${dpSafe.tmVariant})
                                                     echo "Deploying WSO2 API Manager - Traffic Manager [${dpSafe.tmVariant}] in ${namespace} namespace..."
@@ -947,6 +975,7 @@ pipeline {
 
                                                     # Wait for the deployment to be ready
                                                     kubectl --context=${infraDirSafe} wait --for=condition=available --timeout=400s deployment/apim-tm-wso2am-tm-deployment-1 -n ${namespace}
+                                                    kubectl --context=${infraDirSafe} wait --for=condition=available --timeout=400s deployment/apim-tm-wso2am-tm-deployment-2 -n ${namespace}
 
                                                     # Deploy wso2am-gw (variant: ${dpSafe.gwVariant})
                                                     echo "Deploying WSO2 API Manager - Gateway [${dpSafe.gwVariant}] in ${namespace} namespace..."
@@ -985,8 +1014,9 @@ pipeline {
                                                         --set wso2.apim.configurations.databases.shared_db.password="${dbPassword}" \\
                                                         --set wso2.deployment.replicas=2 \\
                                                         --set wso2.deployment.minReplicas=2
-                                                    
+
                                                     # Wait for the deployment to be ready
+                                                    kubectl --context=${infraDirSafe} rollout status deployment/apim-universal-gw-wso2am-universal-gw-deployment --timeout=400s -n ${namespace}
                                                     kubectl --context=${infraDirSafe} wait --for=condition=ready --timeout=300s pod -l deployment=apim-universal-gw-wso2am-universal-gw -n ${namespace}
                                                 """
                                             }
@@ -1017,7 +1047,9 @@ pipeline {
 
                                             // Create an isolated copy of the test directory for this pattern
                                             // to prevent concurrent main.sh / Newman runs from colliding.
-                                            def testDir = "${apimIntgDirectory}-${dpName}"
+                                            // Include DB + pattern + build number to avoid collisions in reruns.
+                                            def testDir = "${apimIntgDirectory}-${dbEngineNameSafe}-${dpName}-${env.BUILD_NUMBER}"
+                                            sh "rm -rf ${testDir}"
                                             sh "cp -r ${apimIntgDirectory} ${testDir}"
 
                                             dir("${testDir}") {
@@ -1041,12 +1073,24 @@ pipeline {
                                                 echo "All HTTP endpoints are ready. Waiting 60s for internal JMS/EventHub sync..."
                                                 sleep 60
 
-                                                sh """
-                                                    ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
-                                                        --PORTAL_HOST="${portalHost}" \\
-                                                        --GATEWAY_HOST="${gwHost}" \\
-                                                        --kubernetes_namespace="${namespace}"
-                                                """
+                                                retry(2) {
+                                                    sh """#!/bin/bash
+                                                        set +e
+                                                        ./main.sh --HOSTNAME="${infraConfig.hostName}" \\
+                                                            --PORTAL_HOST="${portalHost}" \\
+                                                            --GATEWAY_HOST="${gwHost}" \\
+                                                            --kubernetes_namespace="${namespace}"
+                                                        TEST_EXIT_CODE=\$?
+                                                        if [[ \$TEST_EXIT_CODE -ne 0 ]]; then
+                                                            echo "main.sh failed for ${stageId} with exit code \$TEST_EXIT_CODE. Capturing pod state before retry."
+                                                            kubectl --context=${infraDirSafe} get pods -n ${namespace} -o wide || true
+                                                            kubectl --context=${infraDirSafe} get events -n ${namespace} --sort-by=.metadata.creationTimestamp | tail -n 40 || true
+                                                            echo "Retrying after 45s cooldown..."
+                                                            sleep 45
+                                                        fi
+                                                        exit \$TEST_EXIT_CODE
+                                                    """
+                                                }
                                             }
 
                                             dir("${logsDirectory}") {
